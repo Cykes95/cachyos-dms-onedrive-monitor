@@ -13,6 +13,7 @@ PluginComponent {
     property var mounts: []
     property bool refreshInFlight: false
     property string lastError: ""
+    property string lastActionError: ""
     property string lastRefresh: ""
     property bool hasInitialSnapshot: false
     property var activityHistory: []
@@ -163,17 +164,25 @@ PluginComponent {
                 mount.label || mount.path,
                 mount.accountType === "work" ? "Empresa/Educación" : "Personal",
                 mountStatus(mount),
+                "Inicio auto: " + (mount.enabled === "enabled" ? "activado" : "desactivado"),
                 mount.path,
                 "Caché: " + formatBytes(mount.cacheBytes),
                 mount.activity || "sin actividad reciente"
             ].join(" · ");
         });
-        const report = [
+        let reportParts = [
             "=== OneDrive Monitor Diagnostic Report ===",
             "Fecha: " + new Date().toLocaleString(),
-            "Total cuentas: " + mounts.length + " (Activas: " + activeCount + ")",
-            "------------------------------------------"
-        ].concat(lines).join("\n");
+            "Total cuentas: " + mounts.length + " (Activas: " + activeCount + ")"
+        ];
+        if (root.lastError) {
+            reportParts.push("Error de sondeo: " + root.lastError);
+        }
+        if (root.lastActionError) {
+            reportParts.push("Error de última acción: " + root.lastActionError);
+        }
+        reportParts.push("------------------------------------------");
+        const report = reportParts.concat(lines).join("\n");
 
         Quickshell.execDetached(["dms", "cl", "copy", report]);
         ToastService.showInfo("Informe copiado al portapapeles");
@@ -384,8 +393,10 @@ PluginComponent {
         onExited: exitCode => {
             if (exitCode !== 0) {
                 const message = (actionError.text || actionOutput.text || "").trim().split("\n")[0];
+                root.lastActionError = "Fallo en acción '" + actionProcess.verb + "': " + (message || ("código " + exitCode));
                 ToastService.showError("OneDrive", message || ("Error al ejecutar " + actionProcess.verb));
             } else {
+                root.lastActionError = "";
                 switch (actionProcess.verb) {
                 case "start":
                     ToastService.showInfo("OneDrive", "Montaje activado");
@@ -678,23 +689,32 @@ PluginComponent {
 
                                             Column {
                                                 width: parent.width - 70
-                                                spacing: 2
+                                                spacing: 3
                                                 anchors.verticalCenter: parent.verticalCenter
+
+                                                StyledText {
+                                                    width: parent.width
+                                                    text: mount.label || mount.path
+                                                    color: Theme.surfaceText
+                                                    font.pixelSize: Theme.fontSizeMedium
+                                                    font.weight: Font.DemiBold
+                                                    elide: Text.ElideRight
+                                                    maximumLineCount: 1
+                                                }
 
                                                 Row {
                                                     width: parent.width
-                                                    spacing: Theme.spacingXS
+                                                    spacing: Theme.spacingS
 
                                                     StyledText {
-                                                        text: mount.label || mount.path
-                                                        color: Theme.surfaceText
-                                                        font.pixelSize: Theme.fontSizeMedium
-                                                        font.weight: Font.DemiBold
+                                                        text: root.mountStatus(mount)
+                                                        color: root.activityColor(mount)
+                                                        font.pixelSize: Theme.fontSizeSmall
                                                         elide: Text.ElideRight
-                                                        maximumLineCount: 1
+                                                        anchors.verticalCenter: parent.verticalCenter
                                                     }
 
-                                                    // Badge for Account Type
+                                                    // Badge for Account Type placed next to Conectado / Estado
                                                     StyledRect {
                                                         radius: 4
                                                         color: mount.accountType === "work" ? Theme.primaryContainer : Theme.surfaceContainerHighest
@@ -711,14 +731,6 @@ PluginComponent {
                                                             font.weight: Font.Medium
                                                         }
                                                     }
-                                                }
-
-                                                StyledText {
-                                                    width: parent.width
-                                                    text: root.mountStatus(mount)
-                                                    color: root.activityColor(mount)
-                                                    font.pixelSize: Theme.fontSizeSmall
-                                                    elide: Text.ElideRight
                                                 }
                                             }
 
