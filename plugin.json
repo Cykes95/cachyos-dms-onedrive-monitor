@@ -1,8 +1,8 @@
 {
   "id": "onedriverMonitor",
   "name": "OneDrive Monitor",
-  "description": "Monitor and control onedriver mounts, cache usage, transfers and service health",
-  "version": "0.1.0",
+  "description": "Monitor and control multiple onedriver mounts, cache usage, autostart, transfers and service health",
+  "version": "0.2.0",
   "author": "Community",
   "type": "widget",
   "capabilities": ["dankbar-widget", "control-center", "monitoring", "filesystem"],
