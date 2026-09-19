@@ -1,0 +1,16 @@
+{
+  "id": "onedriverMonitor",
+  "name": "OneDrive Monitor",
+  "description": "Monitor and control onedriver mounts, cache usage, transfers and service health",
+  "version": "0.1.0",
+  "author": "Community",
+  "type": "widget",
+  "capabilities": ["dankbar-widget", "control-center", "monitoring", "filesystem"],
+  "component": "./OneDriveMonitor.qml",
+  "settings": "./Settings.qml",
+  "startupCheck": "./StartupCheck.qml",
+  "icon": "cloud_sync",
+  "requires_dms": ">=1.6.0",
+  "dependencies": ["onedriver", "systemctl", "journalctl", "findmnt", "xdg-open"],
+  "permissions": ["settings_read", "settings_write", "process"]
+}
