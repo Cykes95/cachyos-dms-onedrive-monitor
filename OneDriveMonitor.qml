@@ -158,7 +158,7 @@ PluginComponent {
             return "error";
         if (/offline|read-only|solo lectura/.test(activity))
             return "offline";
-        if (/download completed|uploaded|sincronizado|subida completada|descarga completada/.test(activity))
+        if (/upload completed|download completed|uploaded|sincronizado|subida completada|descarga completada/.test(activity))
             return "completed";
         if (/uploading|subiendo|\bupload\b/.test(activity))
             return "upload";
@@ -347,7 +347,7 @@ PluginComponent {
 
     function runAction(mount, verb) {
         if (!mount || !actionsPath || actionProcess.running)
-            return;
+            return false;
 
         const p = Object.assign({}, pendingUnits);
         p[mount.encoded] = verb === "start" ? "starting" : (verb === "stop" ? "stopping" : (verb === "restart" ? "restarting" : (verb === "clear-cache" ? "clearing" : (verb === "remove-mount" ? "removing" : "processing"))));
@@ -357,16 +357,18 @@ PluginComponent {
         actionProcess.target = mount.encoded;
         actionProcess.command = ["timeout", "30s", "sh", actionsPath, verb, mount.encoded];
         actionProcess.running = true;
+        return true;
     }
 
     function runBatchAction(verb) {
         if (!actionsPath || actionProcess.running)
-            return;
+            return false;
         root.pendingBatch = verb;
         actionProcess.verb = verb;
         actionProcess.target = "";
         actionProcess.command = ["timeout", "30s", "sh", actionsPath, verb];
         actionProcess.running = true;
+        return true;
     }
 
     function toggleMount(mount) {
@@ -415,18 +417,22 @@ PluginComponent {
             Quickshell.execDetached(["xdg-open", mount.path]);
             return;
         }
+        if (!runAction(mount, "start")) {
+            ToastService.showWarning("OneDrive", "Hay otra acción en curso, espere un momento…");
+            return;
+        }
         root.pendingOpenMount = mount.encoded;
-        runAction(mount, "start");
         ToastService.showInfo("OneDrive", "Montando " + root.displayLabel(mount) + " antes de abrir la carpeta…");
     }
 
     function parseStatus(output) {
         const result = [];
         const previous = mounts.slice();
+        const hasStatusOk = (output || "").indexOf("#STATUS:OK") !== -1;
         const lines = (output || "").trim().split("\n");
-        const nonEmptyLines = lines.filter(l => l.trim().length > 0);
+        const nonEmptyLines = lines.filter(l => l.trim().length > 0 && !l.startsWith("#"));
         for (const line of lines) {
-            if (!line.trim())
+            if (!line.trim() || line.startsWith("#"))
                 continue;
             const fields = line.split("\t");
             if (fields.length !== 15)
@@ -449,14 +455,15 @@ PluginComponent {
                 cachedFilesCount: Number(fields[14] || 0)
             });
         }
-        if (nonEmptyLines.length > 0 && result.length === 0) {
+        if (nonEmptyLines.length > 0 && result.length === 0 && !hasStatusOk) {
             root.lastError = "Salida del monitor incompleta o no válida (" + nonEmptyLines.length + " líneas descartadas)";
             return;
         }
-        if (result.length === 0 && mounts.length > 0) {
-            // Transient empty output (e.g. systemd reloading): retain previous snapshot
+        if (result.length === 0 && mounts.length > 0 && !hasStatusOk) {
+            // Transient empty output without completion marker: retain previous snapshot
             return;
         }
+        root.lastError = "";
         result.sort((a, b) => (a.label || a.path).localeCompare(b.label || b.path));
         updateActivityHistory(result, previous);
         notifyStateChangesCheck(result, previous);
@@ -476,13 +483,6 @@ PluginComponent {
     Component.onCompleted: {
         _nautilusInitDone = true;
         refresh();
-        if (actionsPath) {
-            if (enableNautilus) {
-                Quickshell.execDetached(["sh", actionsPath, "install-nautilus"]);
-            } else {
-                Quickshell.execDetached(["sh", actionsPath, "uninstall-nautilus"]);
-            }
-        }
     }
 
     Timer {
@@ -565,10 +565,12 @@ PluginComponent {
 
             if (exitCode === 124) {
                 root.pendingUnits = ({});
+                if (root.pendingOpenMount === actionProcess.target) root.pendingOpenMount = "";
                 root.lastActionError = "Tiempo de espera agotado (30s) al ejecutar '" + actionProcess.verb + "'";
                 ToastService.showError("OneDrive", "Tiempo de espera agotado al ejecutar " + actionProcess.verb);
             } else if (exitCode !== 0) {
                 root.pendingUnits = ({});
+                if (root.pendingOpenMount === actionProcess.target) root.pendingOpenMount = "";
                 const message = (actionError.text || actionOutput.text || "").trim().split("\n")[0];
                 root.lastActionError = "Fallo en acción '" + actionProcess.verb + "': " + (message || ("código " + exitCode));
                 ToastService.showError("OneDrive", message || ("Error al ejecutar " + actionProcess.verb));
@@ -759,9 +761,14 @@ PluginComponent {
 
     popoutContent: Component {
         PopoutComponent {
+            readonly property bool effectivelyVisible: (typeof parentPopout !== "undefined" && parentPopout && parentPopout.shouldBeVisible !== undefined) ? parentPopout.shouldBeVisible : visible
+            onEffectivelyVisibleChanged: {
+                root.popoutVisible = effectivelyVisible;
+                if (effectivelyVisible) root.refresh();
+            }
             Component.onCompleted: {
-                root.popoutVisible = true;
-                root.refresh();
+                root.popoutVisible = effectivelyVisible;
+                if (effectivelyVisible) root.refresh();
             }
             Component.onDestruction: {
                 root.popoutVisible = false;

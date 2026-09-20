@@ -19,14 +19,33 @@ chmod 700 "$runtime_dir" 2>/dev/null || true
 
 if [ -r "$config_file" ]; then
     configured_cache=$(sed -n 's/^[[:space:]]*cacheDir:[[:space:]]*//p' "$config_file" | head -n 1)
-    configured_cache=${configured_cache%"\r"}
-    configured_cache=$(printf '%s' "$configured_cache" | tr -d "\"'" )
+    configured_cache=$(printf '%s' "$configured_cache" | sed 's/[[:space:]]*#.*//')
+    configured_cache=$(printf '%s' "$configured_cache" | sed -e 's/^[[:space:]]*["'\'']//' -e 's/["'\''][[:space:]]*$//')
     case "$configured_cache" in
         "~") cache_dir="$home_dir" ;;
-        "~/"*) cache_dir="$home_dir/${configured_cache#~/}" ;;
+        "~/"*) cache_dir="$home_dir/${configured_cache#\~/}" ;;
         /*) cache_dir="$configured_cache" ;;
     esac
 fi
+
+locks_dir="${XDG_RUNTIME_DIR:-/run/user/${UID:-$(id -u)}}/onedrive_locks"
+mkdir -p "$locks_dir" 2>/dev/null && chmod 700 "$locks_dir" 2>/dev/null || true
+
+acquire_account_lock() {
+    enc="$1"
+    lfile="$locks_dir/${enc}.lock"
+    exec 9>"$lfile" 2>/dev/null || return 1
+    if ! flock -x -w 5 9 2>/dev/null; then
+        exec 9>&- 2>/dev/null || true
+        return 1
+    fi
+    return 0
+}
+
+release_account_lock() {
+    flock -u 9 2>/dev/null || true
+    exec 9>&- 2>/dev/null || true
+}
 
 normalize_unit() {
     val="$1"
@@ -292,20 +311,41 @@ case "$cmd" in
     clear-cache)
         encoded=$(normalize_encoded "$1")
         validate_encoded "$encoded"
+
+        # 1. Adquirir bloqueo exclusivo ANTES de alterar el servicio o el disco
+        if ! acquire_account_lock "$encoded"; then
+            echo "Error: la cuenta está ocupada por otra operación (Nautilus)" >&2
+            exit 1
+        fi
+        trap release_account_lock EXIT INT TERM
+
         unit="onedriver@${encoded}.service"
         mountpoint=$(systemd-escape --unescape --path "$encoded" 2>/dev/null || true)
+
+        # 2. Tratar estados activos e intermedios de systemd
         was_active=0
-        if [ "$(systemctl --user is-active "$unit" 2>/dev/null || true)" = "active" ]; then
-            was_active=1
-            systemctl --user stop "$unit" 2>/dev/null || true
-            if ! wait_unit_stopped "$unit"; then
-                echo "Error: no se pudo detener $unit antes de vaciar la caché" >&2
-                exit 1
-            fi
-        fi
+        state=$(systemctl --user is-active "$unit" 2>/dev/null || true)
+        case "$state" in
+            active|activating|reloading)
+                was_active=1
+                systemctl --user stop "$unit" 2>/dev/null || true
+                if ! wait_unit_stopped "$unit"; then
+                    echo "Error: no se pudo detener $unit antes de vaciar la caché" >&2
+                    exit 1
+                fi
+                ;;
+            deactivating)
+                if ! wait_unit_stopped "$unit"; then
+                    echo "Error: la unidad $unit no terminó de detenerse" >&2
+                    exit 1
+                fi
+                ;;
+        esac
+
+        # 3. Comprobar que el punto FUSE realmente esté desmontado
         fusermount_bin=$(command -v fusermount3 || command -v fusermount || true)
         if [ -n "$mountpoint" ] && is_mounted "$mountpoint"; then
-            [ -n "$fusermount_bin" ] && "$fusermount_bin" -uz "$mountpoint" 2>/dev/null || true
+            [ -n "$fusermount_bin" ] && "$fusermount_bin" -u "$mountpoint" 2>/dev/null || true
             sleep 0.2
         fi
         for _ in 1 2 3 4 5; do
@@ -320,41 +360,41 @@ case "$cmd" in
             exit 1
         fi
 
-        # Sincronizar bloqueo con la extensión de Nautilus
-        lock_file="$cache_dir/$encoded/.lock"
-        if command -v flock >/dev/null 2>&1 && [ -d "$cache_dir/$encoded" ]; then
-            exec 9>"$lock_file" 2>/dev/null || true
-            if ! flock -x -w 5 9 2>/dev/null; then
-                echo "Error: la caché está ocupada por otra operación (Nautilus)" >&2
-                exec 9>&- 2>/dev/null || true
+        # 4. Verificar subidas pendientes en onedriver.db antes de purgar
+        db_file="$cache_dir/$encoded/onedriver.db"
+        if [ -f "$db_file" ] && [ -s "$db_file" ]; then
+            has_pending=$(python3 -c "
+import sys, os
+sys.path.insert(0, '$script_dir/integrations/nautilus')
+sys.path.insert(0, os.path.expanduser('~/.local/share/nautilus-python/extensions'))
+try:
+    import onedrive_core
+    res = onedrive_core.read_bbolt_db(r'$db_file')
+    print('1' if res.get('has_pending_uploads') else '0')
+except Exception:
+    print('0')
+" 2>/dev/null || echo "0")
+            if [ "$has_pending" = "1" ]; then
+                echo "Error: la cuenta tiene subidas pendientes a OneDrive. No se puede vaciar la caché para evitar pérdida de datos locales." >&2
                 exit 1
             fi
         fi
 
+        # 5. Purgar ÚNICAMENTE el contenido descargado (content/*), PRESERVANDO onedriver.db
         content_dir="$cache_dir/$encoded/content"
         if [ -d "$content_dir" ]; then
             chmod -R u+w "$content_dir" 2>/dev/null || true
-            rm -rf "$content_dir" 2>/dev/null || true
-            mkdir -p "$content_dir" 2>/dev/null || true
-            chmod 700 "$content_dir" 2>/dev/null || true
+            rm -rf "$content_dir"/* 2>/dev/null || true
+            if [ "$(ls -A "$content_dir" 2>/dev/null)" ]; then
+                echo "Error: no se pudo vaciar completamente el directorio de contenido" >&2
+                exit 1
+            fi
         fi
-        # Remove onedriver.db* to compact metadata and reset cache size completely
-        rm -f "$cache_dir/$encoded/onedriver.db"* 2>/dev/null || true
+
         # Reset all cached files so monitor immediately recalculates
         rm -f "$runtime_dir"/*_"${encoded}.tmp" /tmp/onedriver_*_"${encoded}.tmp" 2>/dev/null || true
 
-        # Liberar bloqueo tras purgar
-        if command -v flock >/dev/null 2>&1 && [ -d "$cache_dir/$encoded" ]; then
-            flock -u 9 2>/dev/null || true
-            exec 9>&- 2>/dev/null || true
-        fi
-
-        # Comprobar que onedriver.db realmente desapareció
-        if [ -f "$cache_dir/$encoded/onedriver.db" ]; then
-            echo "Error: no se pudo eliminar la base de datos onedriver.db" >&2
-            exit 1
-        fi
-
+        # 6. Reiniciar el servicio si estaba activo
         if [ "$was_active" -eq 1 ]; then
             systemctl --user reset-failed "$unit" 2>/dev/null || true
             if ! out=$(systemctl --user start "$unit" 2>&1); then
@@ -368,8 +408,17 @@ case "$cmd" in
     remove-mount)
         encoded=$(normalize_encoded "$1")
         validate_encoded "$encoded"
+
+        # 1. Adquirir bloqueo exclusivo ANTES de detener o borrar
+        if ! acquire_account_lock "$encoded"; then
+            echo "Error: la cuenta está ocupada por otra operación (Nautilus)" >&2
+            exit 1
+        fi
+        trap release_account_lock EXIT INT TERM
+
         unit="onedriver@${encoded}.service"
         mountpoint=$(systemd-escape --unescape --path "$encoded" 2>/dev/null || true)
+
         systemctl --user stop "$unit" 2>/dev/null || true
         if ! wait_unit_stopped "$unit"; then
             echo "Error: no se pudo detener $unit antes de desvincular" >&2
@@ -377,7 +426,7 @@ case "$cmd" in
         fi
         fusermount_bin=$(command -v fusermount3 || command -v fusermount || true)
         if [ -n "$mountpoint" ] && [ -n "$fusermount_bin" ] && is_mounted "$mountpoint"; then
-            "$fusermount_bin" -uz "$mountpoint" 2>/dev/null || true
+            "$fusermount_bin" -u "$mountpoint" 2>/dev/null || true
             sleep 0.2
         fi
         if [ -n "$mountpoint" ] && is_mounted "$mountpoint"; then
@@ -385,17 +434,12 @@ case "$cmd" in
             exit 1
         fi
 
-        # Sincronizar bloqueo con Nautilus antes de desvincular
-        lock_file="$cache_dir/$encoded/.lock"
-        if command -v flock >/dev/null 2>&1 && [ -d "$cache_dir/$encoded" ]; then
-            exec 9>"$lock_file" 2>/dev/null || true
-            if ! flock -x -w 5 9 2>/dev/null; then
-                echo "Error: la cuenta está ocupada por otra operación (Nautilus)" >&2
-                exec 9>&- 2>/dev/null || true
-                exit 1
-            fi
-            flock -u 9 2>/dev/null || true
-            exec 9>&- 2>/dev/null || true
+        # 2. Respaldo de seguridad en caso de haber cambios pendientes o datos en caché
+        if [ -d "$cache_dir/$encoded" ]; then
+            backup_base="${XDG_DATA_HOME:-$home_dir/.local/share}/onedrive-backup"
+            backup_dir="$backup_base/${encoded}_$(date +%Y%m%d_%H%M%S)"
+            mkdir -p "$backup_base" 2>/dev/null || true
+            cp -a "$cache_dir/$encoded" "$backup_dir" 2>/dev/null || true
         fi
 
         if ! systemctl --user disable "$unit" 2>/dev/null; then
@@ -469,6 +513,14 @@ case "$cmd" in
             fi
         fi
 
+        src_core="$script_dir/integrations/nautilus/onedrive_core.py"
+        dest_core="$ext_dir/onedrive_core.py"
+        if [ -f "$src_core" ]; then
+            if [ ! -f "$dest_core" ] || ! cmp -s "$src_core" "$dest_core"; then
+                cp -f "$src_core" "$dest_core" 2>/dev/null || true
+            fi
+        fi
+
         for script_name in "OneDrive - Liberar espacio local" "OneDrive - Descargar en este equipo"; do
             src_script="$script_dir/integrations/nautilus/$script_name"
             dest_script="$scripts_dir/$script_name"
@@ -511,7 +563,7 @@ case "$cmd" in
         scripts_dir="$data_home/nautilus/scripts"
         systemd_override_dir="$config_home/systemd/user/onedriver@.service.d"
 
-        rm -f "$ext_dir/onedrive_extension.py" 2>/dev/null || true
+        rm -f "$ext_dir/onedrive_extension.py" "$ext_dir/onedrive_core.py" 2>/dev/null || true
         rm -f "$scripts_dir/OneDrive - Liberar espacio local" "$scripts_dir/OneDrive - Descargar en este equipo" 2>/dev/null || true
         rm -f "$systemd_override_dir/onedriver-monitor.conf" 2>/dev/null || true
         if [ -f "$systemd_override_dir/override.conf" ] && grep -Fqs "Created by DMS OneDriveMonitor" "$systemd_override_dir/override.conf"; then

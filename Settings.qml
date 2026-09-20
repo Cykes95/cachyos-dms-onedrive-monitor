@@ -4,6 +4,7 @@ import qs.Common
 import qs.Widgets
 import qs.Modules.Plugins
 import qs.Modules.Settings.Widgets
+import qs.Services
 
 PluginSettings {
     id: settingsRoot

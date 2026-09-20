@@ -7,10 +7,16 @@ Permite seleccionar uno o varios archivos/carpetas en Nautilus y descargarlos pa
 import os
 import sys
 import subprocess
-import mmap
-import re
-import fcntl
-import time
+
+# Add extensions directory to path to locate onedrive_core
+_ext_dir = os.path.expanduser("~/.local/share/nautilus-python/extensions")
+if _ext_dir not in sys.path:
+    sys.path.insert(0, _ext_dir)
+_local_dir = os.path.dirname(os.path.abspath(__file__))
+if _local_dir not in sys.path:
+    sys.path.insert(0, _local_dir)
+
+import onedrive_core
 
 raw_paths = os.environ.get("NAUTILUS_SCRIPT_SELECTED_FILE_PATHS", "")
 selected_paths = [p for p in raw_paths.splitlines() if p]
@@ -20,93 +26,39 @@ if not selected_paths:
 if not selected_paths:
     sys.exit(0)
 
-home_dir = os.path.expanduser("~")
-cache_base = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.join(home_dir, ".cache")), "onedriver")
-config_file = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.join(home_dir, ".config")), "onedriver/config.yml")
-
-if os.path.isfile(config_file):
-    try:
-        with open(config_file, "r", encoding="utf-8") as f:
-            for line in f:
-                if line.strip().startswith("cacheDir:"):
-                    val = line.split(":", 1)[1].strip().strip("\"'")
-                    if val.startswith("~"):
-                        cache_base = os.path.expanduser(val)
-                    elif val.startswith("/"):
-                        cache_base = val
-                    break
-    except Exception:
-        pass
-
+cache_base = onedrive_core.get_cache_base()
 if not os.path.isdir(cache_base):
     sys.exit(0)
 
-def _unescape_systemd(encoded: str) -> str:
-    result = []
-    i = 0
-    n = len(encoded)
-    while i < n:
-        if encoded[i:i+2] == "\\x":
-            try:
-                result.append(chr(int(encoded[i+2:i+4], 16)))
-                i += 4
-                continue
-            except Exception:
-                pass
-        if encoded[i] == "-":
-            result.append("/")
-        else:
-            result.append(encoded[i])
-        i += 1
-    path = "".join(result)
-    if not path.startswith("/"):
-        path = "/" + path
-    return path
+active_fuse_mounts = onedrive_core.get_active_fuse_mounts()
 
-# Discovered mounts
+# Discover active mounts
 mounts = {}
-for name in os.listdir(cache_base):
-    if name in ("CacheStorage", "WebKitCache"):
+try:
+    entries = os.listdir(cache_base)
+except OSError:
+    entries = []
+
+for entry in entries:
+    if entry in ("CacheStorage", "WebKitCache"):
         continue
-    cp = os.path.join(cache_base, name)
+    cp = os.path.join(cache_base, entry)
     token = os.path.join(cp, "auth_tokens.json")
     if os.path.isdir(cp) and os.path.isfile(token):
         try:
-            mp = _unescape_systemd(name)
-            if os.path.isdir(mp):
+            mp = onedrive_core.unescape_systemd(entry)
+            if os.path.isdir(mp) and (mp in active_fuse_mounts):
                 mounts[mp] = {
                     "cache_dir": cp,
                     "content_dir": os.path.join(cp, "content"),
-                    "db_path": os.path.join(cp, "onedriver.db")
+                    "db_path": os.path.join(cp, "onedriver.db"),
+                    "encoded": entry
                 }
         except Exception:
             pass
 
-pattern = re.compile(rb'\{"id":"([A-Za-z0-9!_-]+)","name":"([^"]+)".*?"parentReference":\{.*?"path":"([^"]*)".*?,"(file|folder)":', re.DOTALL)
-db_cache = {}
-
-def get_db_info(db_path):
-    if db_path in db_cache:
-        return db_cache[db_path]
-    path_to_id = {}
-    if not os.path.isfile(db_path) or os.path.getsize(db_path) == 0:
-        return path_to_id
-    try:
-        with open(db_path, "rb") as f:
-            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                matches = pattern.findall(mm)
-        for item_id_b, name_b, parent_b, kind_b in matches:
-            if kind_b != b"file":
-                continue
-            clean_parent = parent_b.decode("utf-8", errors="ignore").replace("/drive/root:", "")
-            clean_name = name_b.decode("utf-8", errors="ignore")
-            item_rel = os.path.normpath(os.path.join(clean_parent.lstrip("/"), clean_name))
-            item_id = item_id_b.decode("utf-8", errors="ignore")
-            path_to_id[item_rel] = item_id
-    except Exception:
-        pass
-    db_cache[db_path] = path_to_id
-    return path_to_id
+if not mounts:
+    sys.exit(0)
 
 selected_dirs = {p for p in selected_paths if os.path.isdir(p)}
 pruned_paths = [
@@ -122,12 +74,15 @@ mv = memoryview(buf)
 locks = {}
 lock_failed = False
 
+def walk_error(err):
+    global failed_count
+    failed_count += 1
+
 try:
     for target in pruned_paths:
         if not target:
             continue
 
-        # Match mount
         matched_mp = None
         matched_info = None
         for mp in sorted(mounts.keys(), key=len, reverse=True):
@@ -141,49 +96,32 @@ try:
 
         content_dir = matched_info["content_dir"]
         db_path = matched_info["db_path"]
-        cache_dir = matched_info["cache_dir"]
+        encoded = matched_info["encoded"]
+
         if not os.path.isdir(content_dir) or not os.path.isfile(db_path):
             continue
 
-        if cache_dir not in locks:
-            try:
-                lf = open(os.path.join(cache_dir, ".lock"), "w")
-                locked = False
-                for _ in range(5):
-                    try:
-                        fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        locked = True
-                        break
-                    except (BlockingIOError, OSError):
-                        time.sleep(0.2)
-                if not locked:
-                    try:
-                        lf.close()
-                    except Exception:
-                        pass
-                    lock_failed = True
-                    break
-                locks[cache_dir] = lf
-            except Exception:
-                pass
+        if encoded not in locks:
+            lf, ok = onedrive_core.acquire_lock(encoded, timeout=5.0)
+            if not ok:
+                lock_failed = True
+                break
+            locks[encoded] = lf
 
-        cached_ids = set()
-        if os.path.isdir(content_dir):
-            try:
-                cached_ids = set(os.listdir(content_dir))
-            except Exception:
-                pass
-
-        path_to_id = get_db_info(db_path)
+        snapshot = onedrive_core.read_bbolt_db(db_path, content_dir)
+        path_to_item = snapshot.get("path_to_item", {})
         is_dir = (target == matched_mp) or os.path.isdir(target)
 
         if is_dir:
-            for root_dir, _, filenames in os.walk(target):
+            for root_dir, _, filenames in os.walk(target, onerror=walk_error):
                 for fn in filenames:
                     fp = os.path.join(root_dir, fn)
                     rel_f = os.path.relpath(fp, matched_mp)
-                    cid = path_to_id.get(rel_f)
-                    if cid and cid in cached_ids:
+                    item = path_to_item.get(rel_f)
+                    cid = item["id"] if item else None
+                    remote_size = item["size"] if item else 0
+
+                    if cid and onedrive_core.is_item_cached(content_dir, cid, remote_size):
                         already_cached_count += 1
                         continue
                     try:
@@ -195,8 +133,11 @@ try:
                         failed_count += 1
         else:
             rel_f = os.path.relpath(target, matched_mp)
-            cid = path_to_id.get(rel_f)
-            if cid and cid in cached_ids:
+            item = path_to_item.get(rel_f)
+            cid = item["id"] if item else None
+            remote_size = item["size"] if item else 0
+
+            if cid and onedrive_core.is_item_cached(content_dir, cid, remote_size):
                 already_cached_count += 1
                 continue
             try:
@@ -208,15 +149,11 @@ try:
                 failed_count += 1
 finally:
     for lf in locks.values():
-        try:
-            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
-            lf.close()
-        except Exception:
-            pass
+        onedrive_core.release_lock(lf)
 
 if lock_failed:
     try:
-        subprocess.run(["notify-send", "-a", "OneDrive", "-i", "dialog-warning", "Descarga de OneDrive", "La caché está ocupada por otra operación."])
+        subprocess.run(["notify-send", "-a", "OneDrive", "-i", "dialog-warning", "Descarga de OneDrive", "La cuenta está ocupada por otra operación."])
     except Exception:
         pass
     sys.exit(1)
@@ -228,7 +165,7 @@ elif downloaded_count > 0 and failed_count > 0:
     msg = f"Se descargaron {downloaded_count} archivo(s), pero fallaron {failed_count}."
     icon = "dialog-warning"
 elif failed_count > 0:
-    msg = f"Falló la descarga de {failed_count} archivo(s). Verifique la conexión o el estado de OneDrive."
+    msg = f"Falló la descarga de {failed_count} archivo(s). Verifique la conexión con OneDrive."
     icon = "dialog-error"
 else:
     msg = "Los archivos seleccionados ya estaban descargados en este equipo."

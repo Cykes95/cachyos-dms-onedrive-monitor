@@ -35,10 +35,11 @@ done
 
 if [ -r "$config_file" ]; then
     configured_cache=$(sed -n 's/^[[:space:]]*cacheDir:[[:space:]]*//p' "$config_file" | head -n 1)
-    configured_cache=$(printf '%s' "$configured_cache" | tr -d "\"'" )
+    configured_cache=$(printf '%s' "$configured_cache" | sed 's/[[:space:]]*#.*//')
+    configured_cache=$(printf '%s' "$configured_cache" | sed -e 's/^[[:space:]]*["'\'']//' -e 's/["'\''][[:space:]]*$//')
     case "$configured_cache" in
         "~") cache_dir="$home_dir" ;;
-        "~/"*) cache_dir="$home_dir/${configured_cache#~/}" ;;
+        "~/"*) cache_dir="$home_dir/${configured_cache#\~/}" ;;
         /*) cache_dir="$configured_cache" ;;
     esac
 fi
@@ -283,9 +284,11 @@ Q_EOF
 }
 
 # Discover units from loaded units, enabled unit files, and systemd wants directory
-loaded_units=$(systemctl --user list-units --all --no-legend --no-pager 'onedriver@*.service' 2>/dev/null \
-    | awk '$1 ~ /^onedriver@/ {print $1}' \
-    | sed -n 's/^onedriver@\(.*\)\.service$/\1/p')
+loaded_units=$(systemctl --user list-units --plain --all --no-legend --no-pager 'onedriver@*.service' 2>/dev/null \
+    | awk '{for(i=1;i<=NF;i++) if ($i ~ /^onedriver@.*\.service$/) {sub(/^onedriver@/, "", $i); sub(/\.service$/, "", $i); print $i; break}}')
+
+unit_files=$(systemctl --user list-unit-files --no-legend --no-pager 'onedriver@*.service' 2>/dev/null \
+    | awk '$1 ~ /^onedriver@.*\.service$/ {sub(/^onedriver@/, "", $1); sub(/\.service$/, "", $1); print $1}')
 
 wants_dir="${XDG_CONFIG_HOME:-$home_dir/.config}/systemd/user/default.target.wants"
 wants_units=""
@@ -297,6 +300,7 @@ fi
 # Stream discovery cleanly without printf %b to preserve systemd \x2d escape sequences
 {
     [ -n "$loaded_units" ] && printf '%s\n' "$loaded_units"
+    [ -n "$unit_files" ] && printf '%s\n' "$unit_files"
     [ -n "$wants_units" ] && printf '%s\n' "$wants_units"
     if [ -d "$cache_dir" ]; then
         for d in "$cache_dir"/*; do
@@ -308,3 +312,5 @@ fi
 } | sed '/^[[:space:]]*$/d' \
   | sort -u \
   | while IFS= read -r encoded; do emit_mount "$encoded"; done
+
+printf '#STATUS:OK\n'
