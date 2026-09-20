@@ -1,4 +1,4 @@
-# OneDrive Monitor (v1.0.8)
+# OneDrive Monitor (v1.1.0)
 
 DankMaterialShell widget for [onedriver](https://github.com/jstaf/onedriver).
 
@@ -62,6 +62,22 @@ A native, lightweight monitor and manager for Microsoft OneDrive mounts on Linux
   - `diagnostics`: Copia el informe de diagnóstico al portapapeles.
 
 ## Instalación y recarga
+
+### Instalación para cualquier usuario
+
+Descarga o clona la carpeta del proyecto y, desde ella, ejecuta como usuario normal:
+
+```bash
+./install.sh
+```
+
+El instalador comprueba las dependencias antes de copiar archivos y deja el plugin en
+`~/.config/DankMaterialShell/plugins/OneDriveMonitor`. Para actualizar una instalación
+existente sin perder una copia recuperable, usa `./install.sh --upgrade`. Para comprobar
+un equipo antes de instalar, usa `./install.sh --check`.
+
+Para retirarlo, ejecuta `./uninstall.sh`; mueve el plugin a una copia fechada y elimina
+la integración que este plugin añadió a Nautilus.
 
 ### Requisitos
 
