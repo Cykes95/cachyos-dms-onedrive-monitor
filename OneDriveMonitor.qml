@@ -83,6 +83,16 @@ PluginComponent {
         if (/Configuration file not found|using defaults|Unimplemented opcode|exit-code|signal=TERMINATED/i.test(t))
             return "";
 
+        const manualDownload = manualDownloadActivity(t);
+        if (manualDownload) {
+            if (manualDownload.state === "downloading") return "Descargando: " + manualDownload.name;
+            if (manualDownload.state === "completed") return "Descargado: " + manualDownload.name;
+            if (manualDownload.state === "available") return "Disponible sin conexión: " + manualDownload.name;
+            if (manualDownload.state === "partial") return "Descarga parcial: " + manualDownload.name;
+            if (manualDownload.state === "failed") return "Error al descargar: " + manualDownload.name;
+            return "";
+        }
+
         if (/activityLimitReached|HTTP 429|throttled/i.test(t))
             return "Límite temporal de API de Microsoft (HTTP 429)";
 
@@ -112,6 +122,27 @@ PluginComponent {
             clean = clean.substring(0, 45) + "…";
         }
         return clean;
+    }
+
+    // Only the Nautilus action "Descargar en este equipo" writes these events.
+    // Journal entries from onedriver cannot tell a deliberate download from a
+    // thumbnailer or metadata reader, so they must never be presented as one.
+    function manualDownloadActivity(rawText) {
+        const parts = String(rawText || "").split("|");
+        if (parts.length !== 4 || parts[0] !== "manual-download")
+            return null;
+        if (!/^[A-Za-z0-9_-]+$/.test(parts[1]))
+            return null;
+        if (["downloading", "completed", "available", "partial", "failed"].indexOf(parts[2]) === -1)
+            return null;
+        try {
+            const name = decodeURIComponent(parts[3]);
+            if (!name)
+                return null;
+            return { operationId: parts[1], state: parts[2], name: name };
+        } catch (e) {
+            return null;
+        }
     }
 
     readonly property int activeCount: mounts.filter(mount => mount.active === "active" && mount.mounted === "1").length
@@ -148,6 +179,13 @@ PluginComponent {
         if (!raw) return "idle";
         if (/Configuration file not found|using defaults|Unimplemented opcode|exit-code|signal=TERMINATED/i.test(raw))
             return "idle";
+
+        const manualDownload = manualDownloadActivity(raw);
+        if (manualDownload) {
+            if (manualDownload.state === "downloading") return "download";
+            if (manualDownload.state === "partial" || manualDownload.state === "failed") return "error";
+            return "completed";
+        }
 
         const activity = raw.toLowerCase();
         if (/activitylimitreached|http 429|throttled/.test(activity))
@@ -298,13 +336,24 @@ PluginComponent {
             const cleanText = formatActivity(mount.activity);
             if (cleanText && kind !== "idle" && (!old || old.activity !== mount.activity)) {
                 const label = root.displayLabel(mount);
-                if (next.length === 0 || next[0].text !== cleanText || next[0].label !== label) {
-                    next.unshift({
-                        label: label,
-                        text: cleanText,
-                        time: Qt.formatTime(new Date(), "hh:mm"),
-                        kind: kind
-                    });
+                const manualDownload = manualDownloadActivity(mount.activity);
+                const eventKey = manualDownload
+                    ? "manual-download:" + mount.encoded + ":" + manualDownload.operationId
+                    : "journal:" + mount.encoded + ":" + cleanText;
+                const entry = {
+                    key: eventKey,
+                    label: label,
+                    text: cleanText,
+                    time: Qt.formatTime(new Date(), "hh:mm"),
+                    kind: kind
+                };
+                const existing = next.findIndex(item => item.key === eventKey);
+                if (existing >= 0) {
+                    // A transfer is one item: replace its temporary progress line
+                    // with its terminal state instead of appending a second line.
+                    next[existing] = entry;
+                } else if (next.length === 0 || next[0].text !== cleanText || next[0].label !== label) {
+                    next.unshift(entry);
                 }
             }
         });

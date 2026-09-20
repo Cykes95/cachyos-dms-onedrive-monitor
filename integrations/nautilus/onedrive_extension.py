@@ -12,6 +12,7 @@ import time
 import threading
 import subprocess
 import unicodedata
+import urllib.parse
 import weakref
 import gi
 
@@ -36,6 +37,52 @@ def _notify(title: str, message: str, icon: str = "onedrive-custom-cloud"):
         subprocess.Popen(["notify-send", "-a", "OneDrive", "-i", icon, title, message])
     except Exception:
         pass
+
+
+def _publish_manual_download_activity(encoded: str, operation_id: str, state: str, name: str):
+    """Publish a bounded, user-initiated download event for the DMS widget.
+
+    OneDriver's journal cannot identify the FUSE client that opened a file: a
+    thumbnailer produces exactly the same download messages as the explicit
+    Nautilus menu action.  This private runtime file is therefore the only
+    source used by the widget for download activity.
+    """
+    if not encoded or "/" in encoded or encoded in (".", ".."):
+        return
+    if state not in ("downloading", "completed", "available", "partial", "failed"):
+        return
+    if not operation_id or not all(c.isalnum() or c in "_-" for c in operation_id):
+        return
+
+    runtime_base = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    runtime_dir = os.path.join(runtime_base, "onedriver_dms")
+    try:
+        os.makedirs(runtime_dir, mode=0o700, exist_ok=True)
+        os.chmod(runtime_dir, 0o700)
+        event_path = os.path.join(runtime_dir, f"manual_activity_{encoded}.tmp")
+        safe_name = urllib.parse.quote(str(name), safe="")
+        payload = f"v1\t{int(time.time())}\t{state}\t{operation_id}\t{safe_name}\n"
+        temp_path = f"{event_path}.{os.getpid()}.{threading.get_ident()}"
+        fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="ascii") as event_file:
+                event_file.write(payload)
+            os.replace(temp_path, event_path)
+        except Exception:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+    except OSError:
+        # Activity reporting is optional; never make a manual download fail for it.
+        pass
+
+
+def _download_activity_label(items: list) -> str:
+    if len(items) == 1:
+        rel_path = items[0][6] or items[0][1]
+        return os.path.basename(rel_path.rstrip("/")) or rel_path
+    return f"{len(items)} elementos"
 
 class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuProvider):
     def __init__(self):
@@ -581,6 +628,16 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                 except Exception:
                     pass
 
+        operation_id = f"{int(time.time() * 1000000):x}_{threading.get_ident():x}"
+        activity_targets = {}
+        for item in targets_to_download:
+            mount_info = item[3]
+            encoded = mount_info.get("encoded") if mount_info else None
+            if encoded:
+                activity_targets.setdefault(encoded, []).append(item)
+        for encoded, items in activity_targets.items():
+            _publish_manual_download_activity(encoded, operation_id, "downloading", _download_activity_label(items))
+
         def worker():
             mounts_involved = {}
             for item in targets_to_download:
@@ -610,14 +667,25 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                         GLib.idle_add(lambda f=file: (f.invalidate_extension_info(), False)[1])
                     except Exception:
                         pass
+                for encoded, items in activity_targets.items():
+                    _publish_manual_download_activity(encoded, operation_id, "failed", _download_activity_label(items))
                 _notify("OneDrive", "La cuenta está ocupada por otra operación.", "dialog-warning")
                 return
 
             downloaded = 0
             already_cached = 0
             failed = 0
+            per_mount = {
+                encoded: {"downloaded": 0, "already_cached": 0, "failed": 0}
+                for encoded in mounts_involved
+            }
             buf = bytearray(1024 * 1024)
             mv = memoryview(buf)
+
+            def record(mount_info, outcome):
+                encoded = mount_info.get("encoded") if mount_info else None
+                if encoded in per_mount:
+                    per_mount[encoded][outcome] += 1
 
             def walk_error(err):
                 nonlocal failed
@@ -648,10 +716,16 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                                             pass
                                     if preset_cached:
                                         already_cached += 1
-                                    else:
+                                        record(mount_info, "already_cached")
+                                    elif cid_f and onedrive_core.is_item_cached(content_dir, cid_f, remote_size, expected_hash, item_info=item):
                                         downloaded += 1
+                                        record(mount_info, "downloaded")
+                                    else:
+                                        failed += 1
+                                        record(mount_info, "failed")
                                 except Exception:
                                     failed += 1
+                                    record(mount_info, "failed")
                                 finally:
                                     with self._sync_lock:
                                         self.syncing_paths.discard(fp)
@@ -670,10 +744,16 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                                     pass
                             if preset_cached:
                                 already_cached += 1
-                            else:
+                                record(mount_info, "already_cached")
+                            elif item_id and onedrive_core.is_item_cached(content_dir, item_id, remote_size, expected_hash, item_info=item):
                                 downloaded += 1
+                                record(mount_info, "downloaded")
+                            else:
+                                failed += 1
+                                record(mount_info, "failed")
                         except Exception:
                             failed += 1
+                            record(mount_info, "failed")
                         finally:
                             with self._sync_lock:
                                 self.syncing_paths.discard(file_path)
@@ -694,6 +774,16 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                         GLib.idle_add(lambda f=file: (f.invalidate_extension_info(), False)[1])
                     except Exception:
                         pass
+
+                for encoded, items in activity_targets.items():
+                    stats = per_mount.get(encoded, {})
+                    if stats.get("failed", 0) > 0 or failed > 0:
+                        state = "partial" if stats.get("downloaded", 0) > 0 else "failed"
+                    elif stats.get("downloaded", 0) > 0:
+                        state = "completed"
+                    else:
+                        state = "available"
+                    _publish_manual_download_activity(encoded, operation_id, state, _download_activity_label(items))
 
                 if downloaded > 0 and failed == 0:
                     _notify("OneDrive: Descarga completada", f"Se descargaron {downloaded} archivo(s) para uso sin conexión.", "onedrive-custom-synced")

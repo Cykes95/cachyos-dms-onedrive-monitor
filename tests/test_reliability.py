@@ -9,6 +9,7 @@ Verifies:
 5. _HASH_CACHE key includes st_dev and ctime_ns.
 6. Event coalescing via content_dirty in worker.
 7. Cache clearing safely purges dotfiles and hidden directories.
+8. Manual-download activity events are atomically encoded for the widget.
 """
 
 import os
@@ -262,6 +263,39 @@ def test_extension_invalidation_and_bounded_active_files():
     print("PASS")
 
 
+def test_manual_download_activity_event():
+    print("Running test_manual_download_activity_event...", end=" ")
+    import onedrive_extension
+
+    original_runtime = os.environ.get("XDG_RUNTIME_DIR")
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["XDG_RUNTIME_DIR"] = tmpdir
+            encoded = "home-test-OneDrive\\x2dLab"
+            operation = "abc_123"
+            onedrive_extension._publish_manual_download_activity(
+                encoded, operation, "completed", "Informe final | revisión.pptx"
+            )
+            event_path = os.path.join(tmpdir, "onedriver_dms", f"manual_activity_{encoded}.tmp")
+            with open(event_path, "r", encoding="ascii") as event_file:
+                fields = event_file.read().rstrip("\n").split("\t")
+            assert fields[0] == "v1"
+            assert fields[2] == "completed"
+            assert fields[3] == operation
+            assert fields[4] == "Informe%20final%20%7C%20revisi%C3%B3n.pptx"
+            assert stat.S_IMODE(os.stat(event_path).st_mode) == 0o600
+
+            # Unsafe account identifiers must never produce a file outside the runtime directory.
+            onedrive_extension._publish_manual_download_activity("../unsafe", operation, "completed", "x")
+            assert not os.path.exists(os.path.join(tmpdir, "manual_activity_unsafe.tmp"))
+    finally:
+        if original_runtime is None:
+            os.environ.pop("XDG_RUNTIME_DIR", None)
+        else:
+            os.environ["XDG_RUNTIME_DIR"] = original_runtime
+    print("PASS")
+
+
 def test_async_info_provider_contract():
     print("Running test_async_info_provider_contract...", end=" ")
     import gi
@@ -335,5 +369,6 @@ if __name__ == "__main__":
     test_clear_cache_with_dotfiles()
     test_large_cache_performance()
     test_extension_invalidation_and_bounded_active_files()
+    test_manual_download_activity_event()
     test_async_info_provider_contract()
-    print("=== All 10 Reliability Tests PASSED successfully! ===")
+    print("=== All 11 Reliability Tests PASSED successfully! ===")

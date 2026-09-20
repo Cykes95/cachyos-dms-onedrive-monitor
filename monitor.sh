@@ -247,7 +247,10 @@ Q_EOF
         fi
     fi
 
-    # Optimization: Cache journalctl activity for 10s when active
+    # Optimization: Cache journalctl activity for 10s when active.
+    # Do not treat onedriver's Downloading/Download completed lines as user
+    # activity: FUSE receives the same lines for thumbnailing and MIME probing.
+    # Explicit offline downloads are supplied by the Nautilus extension below.
     activity=""
     act_cache_file="$runtime_dir/act_${encoded}.tmp"
     if [ "$active" = "active" ]; then
@@ -262,12 +265,38 @@ Q_EOF
         if [ "$read_act" -eq 1 ]; then
             activity=$(journalctl --user -u "$unit" --since "5 minutes ago" -n 35 --no-pager --quiet -o cat 2>/dev/null \
                 | grep -v -Ei 'Configuration file not found|using defaults|Unimplemented opcode|exit-code|signal=TERMINATED' \
-                | grep -Ei 'Download completed|Downloading|Upload completed|Uploading|offline|online|Failed to unmount' \
+                | grep -Ei 'Upload completed|Uploading|offline|online|Failed to unmount' \
                 | tail -n 1 \
                 | tr '\t\r\n' ' ' \
                 | sed -E 's/\x1B\[[0-9;]*[[:alpha:]]//g' \
                 | sed 's/[[:space:]][[:space:]]*/ /g')
             write_atomic "$act_cache_file" "$now $activity"
+        fi
+
+        manual_activity_file="$runtime_dir/manual_activity_${encoded}.tmp"
+        if [ -r "$manual_activity_file" ]; then
+            IFS='	' read -r manual_version manual_timestamp manual_state manual_operation manual_name < "$manual_activity_file" 2>/dev/null || true
+            manual_ttl=0
+            case "$manual_version" in v1) ;; *) manual_timestamp="" ;; esac
+            case "$manual_timestamp" in ''|*[!0-9]*) ;; *)
+                case "$manual_operation" in ''|*[!-A-Za-z0-9_]*) ;; *)
+                    # urllib.parse.quote(..., safe="") emits only this alphabet.
+                    case "$manual_name" in ''|*[!-A-Za-z0-9._~%]*) ;; *)
+                        case "$manual_state" in
+                            downloading) manual_ttl=3600 ;;
+                            completed|available|partial|failed) manual_ttl=900 ;;
+                        esac
+                        ;;
+                    esac
+                    ;;
+                esac
+                ;;
+            esac
+            if [ "$manual_ttl" -gt 0 ] && [ "$now" -ge "$manual_timestamp" ] && [ "$((now - manual_timestamp))" -le "$manual_ttl" ]; then
+                activity="manual-download|$manual_operation|$manual_state|$manual_name"
+            elif [ "$manual_ttl" -eq 0 ] || [ "$((now - manual_timestamp))" -gt "$manual_ttl" ]; then
+                rm -f "$manual_activity_file" 2>/dev/null || true
+            fi
         fi
     else
         rm -f "$act_cache_file" 2>/dev/null || true

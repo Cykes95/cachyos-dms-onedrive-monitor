@@ -1,4 +1,4 @@
-# OneDrive Monitor (v1.1.0)
+# OneDrive Monitor (v1.2.0)
 
 DankMaterialShell widget for [onedriver](https://github.com/jstaf/onedriver).
 
@@ -37,7 +37,12 @@ A native, lightweight monitor and manager for Microsoft OneDrive mounts on Linux
   - Pastilla para barra superior en orientaciones horizontal y vertical con icono dinámico según el estado global (`cloud_done`, `cloud_sync`, `sync_problem`, `cloud_off`).
   - Mosaico en el Centro de Control (`ccWidget`) para alternar estado con un toque e icono reactivo.
   - Notificaciones nativas mediante `ToastService` ante desconexiones, errores o reconexiones.
-  - Historial de actividad de subida, descarga y finalización de transferencias de la sesión.
+  - Historial de actividad de subidas y de descargas iniciadas explícitamente desde
+    Nautilus. Las lecturas automáticas para miniaturas, tipo MIME o indexado no se
+    presentan como descargas del usuario.
+  - Cada descarga manual ocupa una única línea: «Descargando» se reemplaza por el
+    resultado verificado («Descargado», «Disponible sin conexión» o error), sin
+    duplicar el historial.
   - Carga síncrona optimizada al iniciar la shell sin bloqueos ni retrasos.
   - Diagnóstico completo copiable al portapapeles con un clic.
 
