@@ -213,17 +213,19 @@ def compute_file_quickxorhash(file_path: str, chunk_size: int = 65536) -> str:
     return hasher.b64digest()
 
 
-_HASH_CACHE = {}  # (st_ino, st_size, st_mtime_ns) -> b64_hash
+_HASH_CACHE = {}  # (st_dev, st_ino, st_size, st_mtime_ns, st_ctime_ns) -> b64_hash
 
 def get_cached_quickxorhash(file_path: str, st: os.stat_result = None) -> str:
     """
-    Returns QuickXorHash for file_path, memoizing results by (st_ino, st_size, st_mtime_ns).
-    Avoids re-reading and re-hashing files that have not changed.
+    Returns QuickXorHash for file_path, memoizing results by (st_dev, st_ino, st_size, st_mtime_ns, st_ctime_ns).
+    Avoids re-reading and re-hashing files that have not changed across devices or metadata touches.
     """
     try:
         if st is None:
             st = os.stat(file_path)
-        cache_key = (st.st_ino, st.st_size, st.st_mtime_ns)
+        mtime_ns = getattr(st, 'st_mtime_ns', int(st.st_mtime * 1e9))
+        ctime_ns = getattr(st, 'st_ctime_ns', int(st.st_ctime * 1e9))
+        cache_key = (st.st_dev, st.st_ino, st.st_size, mtime_ns, ctime_ns)
         cached = _HASH_CACHE.get(cache_key)
         if cached is not None:
             return cached
@@ -237,13 +239,64 @@ def get_cached_quickxorhash(file_path: str, st: os.stat_result = None) -> str:
         return None
 
 
-def is_item_cached(content_dir: str, item_id: str, remote_size: int = 0, expected_hash: str = None) -> bool:
+def verify_file_hash(target_file: str, st: os.stat_result, item_info: dict) -> bool:
+    """
+    Cryptographically verifies that target_file matches the remote item_info.
+    Checks QuickXorHash first, then sha1Hash, then sha256Hash if available.
+    If no cryptographic hash is present in the remote metadata, fails safe (returns False).
+    """
+    if not item_info or not os.path.isfile(target_file):
+        return False
+
+    quick_hash = item_info.get("hash")
+    if not quick_hash and isinstance(item_info.get("hashes"), dict):
+        quick_hash = item_info["hashes"].get("quickXorHash")
+    if quick_hash:
+        actual_hash = get_cached_quickxorhash(target_file, st)
+        return bool(actual_hash and actual_hash == quick_hash)
+
+    # Fallback to sha1Hash if present in Graph metadata
+    sha1 = item_info.get("sha1")
+    if not sha1 and isinstance(item_info.get("hashes"), dict):
+        sha1 = item_info["hashes"].get("sha1Hash")
+    if sha1:
+        try:
+            import hashlib
+            h = hashlib.sha1()
+            with open(target_file, "rb") as f:
+                while chunk := f.read(131072):
+                    h.update(chunk)
+            return h.hexdigest().lower() == sha1.lower()
+        except OSError:
+            return False
+
+    # Fallback to sha256Hash if present in Graph metadata
+    sha256 = item_info.get("sha256")
+    if not sha256 and isinstance(item_info.get("hashes"), dict):
+        sha256 = item_info["hashes"].get("sha256Hash")
+    if sha256:
+        try:
+            import hashlib
+            h = hashlib.sha256()
+            with open(target_file, "rb") as f:
+                while chunk := f.read(131072):
+                    h.update(chunk)
+            return h.hexdigest().lower() == sha256.lower()
+        except OSError:
+            return False
+
+    # Fail safe: no verifiable hash available -> cannot declare as downloaded!
+    return False
+
+
+def is_item_cached(content_dir: str, item_id: str, remote_size: int = 0, expected_hash: str = None, item_info: dict = None) -> bool:
     """
     Verifies if an item is physically, regularly and verified-cached on disk.
     Requires:
     1. Target file exists in content_dir, is regular file (stat.S_ISREG), not a symlink.
     2. Size matches exact remote size (if remote_size is valid >= 0).
-    3. If expected_hash (QuickXorHash) is provided, computed QuickXorHash must match.
+    3. Cryptographic hash (QuickXorHash, sha1 or sha256) matches remote metadata.
+       Fails safe: if no cryptographic hash is available from OneDrive, returns False.
     """
     if not content_dir or not item_id:
         return False
@@ -258,11 +311,12 @@ def is_item_cached(content_dir: str, item_id: str, remote_size: int = 0, expecte
             return False
         if st.st_size != int(remote_size):
             return False
-        if expected_hash:
+        if item_info:
+            return verify_file_hash(target_file, st, item_info)
+        elif expected_hash:
             actual_hash = get_cached_quickxorhash(target_file, st)
-            if actual_hash != expected_hash:
-                return False
-        return True
+            return actual_hash == expected_hash
+        return False
     except OSError:
         return False
 
@@ -335,11 +389,8 @@ def compute_cache_status(content_dir: str, path_to_item: dict, known_folders: se
             remote_size = item_info.get("size", 0)
             if remote_size is None or int(remote_size) < 0 or st.st_size != int(remote_size):
                 continue
-            expected_hash = item_info.get("hash")
-            if expected_hash:
-                actual_hash = get_cached_quickxorhash(target_file, st)
-                if actual_hash != expected_hash:
-                    continue
+            if not verify_file_hash(target_file, st, item_info):
+                continue
             cached_ids.add(item_id)
 
         # Folder status propagation
@@ -538,11 +589,16 @@ def read_bbolt_db(db_path: str, content_dir: str = None) -> dict:
                 file_facet = obj.get("file") or {}
                 hashes = file_facet.get("hashes") or {}
                 quick_hash = hashes.get("quickXorHash")
+                sha1_hash = hashes.get("sha1Hash")
+                sha256_hash = hashes.get("sha256Hash")
                 item_info = {
                     "id": item_id,
                     "name": name,
                     "size": size,
                     "hash": quick_hash,
+                    "sha1": sha1_hash,
+                    "sha256": sha256_hash,
+                    "hashes": hashes,
                     "rel_path": rel_path
                 }
                 path_to_item[rel_path] = item_info

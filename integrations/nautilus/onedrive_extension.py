@@ -73,7 +73,13 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
             Gio.FileMonitorEvent.DELETED,
             Gio.FileMonitorEvent.ATTRIBUTE_CHANGED
         ):
+            if file:
+                name = file.get_basename() or ""
+                if name.startswith(("temp-", ".tmp", ".fuse_hidden")) or name.endswith((".tmp", "~")):
+                    return
+
             with mount_info["lock"]:
+                mount_info["content_dirty"] = True
                 timer_id = mount_info.get("reload_timer_id")
                 if timer_id:
                     GLib.source_remove(timer_id)
@@ -140,6 +146,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                             "snapshot": None,
                             "db_ready": False,
                             "loading_db": False,
+                            "content_dirty": False,
                             "mtime": 0,
                             "content_mtime": 0,
                             "last_error_time": 0,
@@ -202,24 +209,8 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
             if not need_db_reload and not need_content_refresh:
                 return
 
-            # Synchronous fast-path on initial load:
-            # When snapshot is not yet loaded, read it synchronously (15ms)
-            # so the first render of Nautilus receives emblems immediately!
-            if mount_info.get("snapshot") is None:
-                try:
-                    snapshot = onedrive_core.read_bbolt_db(db_path, content_dir)
-                    if snapshot and snapshot.get("read_success"):
-                        mount_info["snapshot"] = snapshot
-                        mount_info["mtime"] = db_mtime
-                        mount_info["content_mtime"] = content_mtime
-                        mount_info["txid"] = snapshot.get("txid", 0)
-                        mount_info["db_ready"] = True
-                        mount_info["last_error_time"] = 0
-                        return
-                except Exception:
-                    pass
-
             if mount_info["loading_db"]:
+                mount_info["content_dirty"] = True
                 # Only register interested FileInfo when a load is actively occurring
                 if file_or_files:
                     if isinstance(file_or_files, (list, set, tuple)):
@@ -229,6 +220,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                 return
 
             mount_info["loading_db"] = True
+            mount_info["content_dirty"] = False
             if file_or_files:
                 if isinstance(file_or_files, (list, set, tuple)):
                     mount_info["pending_invalidation"].update(f for f in file_or_files if isinstance(f, Nautilus.FileInfo))
@@ -237,37 +229,47 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
 
         def worker():
             nonlocal need_db_reload, need_content_refresh
-            snapshot = None
-            error_occurred = False
+            while True:
+                with mount_info["lock"]:
+                    mount_info["content_dirty"] = False
+                    current_snap = mount_info.get("snapshot")
 
-            try:
-                if need_db_reload:
-                    snapshot = onedrive_core.read_bbolt_db(db_path, content_dir)
-                    if not snapshot or not snapshot.get("read_success"):
-                        error_occurred = True
-                elif need_content_refresh:
-                    with mount_info["lock"]:
-                        current_snap = mount_info.get("snapshot")
-                    if current_snap and current_snap.get("read_success"):
-                        path_to_item = current_snap.get("path_to_item", {})
-                        known_folders = current_snap.get("known_folders", set())
-                        id_to_item = current_snap.get("id_to_item")
-                        folder_file_counts = current_snap.get("folder_file_counts")
-                        cache_status = onedrive_core.compute_cache_status(
-                            content_dir,
-                            path_to_item,
-                            known_folders,
-                            id_to_item,
-                            folder_file_counts=folder_file_counts
-                        )
-                        snapshot = dict(current_snap)
-                        snapshot.update(cache_status)
-                    else:
+                snapshot = None
+                error_occurred = False
+
+                try:
+                    if need_db_reload:
                         snapshot = onedrive_core.read_bbolt_db(db_path, content_dir)
                         if not snapshot or not snapshot.get("read_success"):
                             error_occurred = True
-            except Exception:
-                error_occurred = True
+                    elif need_content_refresh:
+                        if current_snap and current_snap.get("read_success"):
+                            path_to_item = current_snap.get("path_to_item", {})
+                            known_folders = current_snap.get("known_folders", set())
+                            id_to_item = current_snap.get("id_to_item")
+                            folder_file_counts = current_snap.get("folder_file_counts")
+                            cache_status = onedrive_core.compute_cache_status(
+                                content_dir,
+                                path_to_item,
+                                known_folders,
+                                id_to_item,
+                                folder_file_counts=folder_file_counts
+                            )
+                            snapshot = dict(current_snap)
+                            snapshot.update(cache_status)
+                        else:
+                            snapshot = onedrive_core.read_bbolt_db(db_path, content_dir)
+                            if not snapshot or not snapshot.get("read_success"):
+                                error_occurred = True
+                except Exception:
+                    error_occurred = True
+
+                with mount_info["lock"]:
+                    if mount_info.get("content_dirty"):
+                        need_db_reload = False
+                        need_content_refresh = True
+                        continue
+                    break
 
             def apply_snapshot():
                 with mount_info["lock"]:
