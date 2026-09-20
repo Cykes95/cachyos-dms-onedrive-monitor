@@ -47,6 +47,30 @@ normalize_encoded() {
     esac
 }
 
+is_mounted() {
+    mp="$1"
+    [ -n "$mp" ] || return 1
+    if command -v findmnt >/dev/null 2>&1; then
+        findmnt -rn -M "$mp" >/dev/null 2>&1
+    elif [ -r /proc/mounts ]; then
+        grep -Fqs " $mp " /proc/mounts
+    else
+        return 1
+    fi
+}
+
+wait_unit_stopped() {
+    u="$1"
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        st=$(systemctl --user is-active "$u" 2>/dev/null || true)
+        case "$st" in
+            inactive|dead|failed|unknown) return 0 ;;
+            *) sleep 0.2 ;;
+        esac
+    done
+    return 1
+}
+
 validate_encoded() {
     val="$1"
     case "$val" in
@@ -60,9 +84,12 @@ validate_encoded() {
 ensure_systemd_override() {
     fusermount_bin=$(command -v fusermount3 || command -v fusermount || echo /usr/bin/fusermount3)
     systemd_override_dir="${XDG_CONFIG_HOME:-$home_dir/.config}/systemd/user/onedriver@.service.d"
-    if [ ! -f "$systemd_override_dir/override.conf" ]; then
+    override_file="$systemd_override_dir/onedriver-monitor.conf"
+    # Remove legacy override.conf if created previously by older plugin versions
+    [ -f "$systemd_override_dir/override.conf" ] && rm -f "$systemd_override_dir/override.conf" 2>/dev/null || true
+    if [ ! -f "$override_file" ]; then
         mkdir -p "$systemd_override_dir" 2>/dev/null || true
-        printf '[Service]\nExecStopPost=\nExecStopPost=-%s -uz /%%I\n' "$fusermount_bin" > "$systemd_override_dir/override.conf" 2>/dev/null || true
+        printf '[Service]\nExecStopPost=\nExecStopPost=-%s -uz /%%I\n' "$fusermount_bin" > "$override_file" 2>/dev/null || true
         systemctl --user daemon-reload 2>/dev/null || true
     fi
 }
@@ -198,19 +225,19 @@ case "$cmd" in
         encoded=$(normalize_encoded "$1")
         validate_encoded "$encoded"
         unit="onedriver@${encoded}.service"
+        mountpoint=$(systemd-escape --unescape --path "$encoded" 2>/dev/null || true)
         was_active=0
         if [ "$(systemctl --user is-active "$unit" 2>/dev/null || true)" = "active" ]; then
             was_active=1
             systemctl --user stop "$unit" 2>/dev/null || true
-            for _ in 1 2 3 4 5 6 7 8 9 10; do
-                st=$(systemctl --user is-active "$unit" 2>/dev/null || true)
-                [ "$st" != "active" ] && [ "$st" != "deactivating" ] && break
-                sleep 0.2
-            done
-            if [ "$(systemctl --user is-active "$unit" 2>/dev/null || true)" = "active" ]; then
+            if ! wait_unit_stopped "$unit"; then
                 echo "Error: no se pudo detener $unit antes de vaciar la caché" >&2
                 exit 1
             fi
+        fi
+        if [ -n "$mountpoint" ] && is_mounted "$mountpoint"; then
+            echo "Error: el punto de montaje $mountpoint sigue montado; no se puede vaciar la caché con seguridad" >&2
+            exit 1
         fi
         content_dir="$cache_dir/$encoded/content"
         if [ -d "$content_dir" ]; then
@@ -235,22 +262,24 @@ case "$cmd" in
         unit="onedriver@${encoded}.service"
         mountpoint=$(systemd-escape --unescape --path "$encoded" 2>/dev/null || true)
         systemctl --user stop "$unit" 2>/dev/null || true
-        for _ in 1 2 3 4 5 6 7 8 9 10; do
-            st=$(systemctl --user is-active "$unit" 2>/dev/null || true)
-            [ "$st" != "active" ] && [ "$st" != "deactivating" ] && break
-            sleep 0.2
-        done
-        if [ "$(systemctl --user is-active "$unit" 2>/dev/null || true)" = "active" ]; then
+        if ! wait_unit_stopped "$unit"; then
             echo "Error: no se pudo detener $unit antes de desvincular" >&2
             exit 1
         fi
-        systemctl --user disable "$unit" 2>/dev/null || true
+        fusermount_bin=$(command -v fusermount3 || command -v fusermount || true)
+        if [ -n "$mountpoint" ] && [ -n "$fusermount_bin" ] && is_mounted "$mountpoint"; then
+            "$fusermount_bin" -uz "$mountpoint" 2>/dev/null || true
+            sleep 0.2
+        fi
+        if [ -n "$mountpoint" ] && is_mounted "$mountpoint"; then
+            echo "Error: el punto de montaje $mountpoint sigue ocupado; no se puede desvincular" >&2
+            exit 1
+        fi
+        if ! systemctl --user disable "$unit" 2>/dev/null; then
+            echo "Advertencia: no se pudo deshabilitar inicio automático de $unit" >&2
+        fi
         systemctl --user reset-failed "$unit" 2>/dev/null || true
         systemctl --user daemon-reload 2>/dev/null || true
-        fusermount_bin=$(command -v fusermount3 || command -v fusermount || true)
-        if [ -n "$mountpoint" ] && [ -n "$fusermount_bin" ]; then
-            "$fusermount_bin" -uz "$mountpoint" 2>/dev/null || true
-        fi
         rm -rf "$cache_dir/$encoded" 2>/dev/null || true
         rm -f "$runtime_dir"/*_"${encoded}.tmp" /tmp/onedriver_*_"${encoded}.tmp" 2>/dev/null || true
         echo "removed mount $encoded"
@@ -340,10 +369,17 @@ case "$cmd" in
         ;;
     uninstall-nautilus)
         data_home="${XDG_DATA_HOME:-$home_dir/.local/share}"
+        config_home="${XDG_CONFIG_HOME:-$home_dir/.config}"
         ext_dir="$data_home/nautilus-python/extensions"
         scripts_dir="$data_home/nautilus/scripts"
+        systemd_override_dir="$config_home/systemd/user/onedriver@.service.d"
+
         rm -f "$ext_dir/onedrive_extension.py" 2>/dev/null || true
         rm -f "$scripts_dir/OneDrive - Liberar espacio local" "$scripts_dir/OneDrive - Descargar en este equipo" 2>/dev/null || true
+        if [ -f "$systemd_override_dir/onedriver-monitor.conf" ] || [ -f "$systemd_override_dir/override.conf" ]; then
+            rm -f "$systemd_override_dir/onedriver-monitor.conf" "$systemd_override_dir/override.conf" 2>/dev/null || true
+            systemctl --user daemon-reload 2>/dev/null || true
+        fi
         if pgrep -x nautilus >/dev/null 2>&1; then
             nautilus -q 2>/dev/null || true
         fi

@@ -18,6 +18,7 @@ PluginComponent {
     property bool hasInitialSnapshot: false
     property var activityHistory: []
     property var pendingUnits: ({})
+    property string pendingBatch: ""
     property bool popoutVisible: false
 
     readonly property string pluginPath: String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "").replace(/\/+$/, "")
@@ -59,6 +60,10 @@ PluginComponent {
     readonly property bool allActive: mounts.length > 0 && activeCount === mounts.length
 
     readonly property string summary: {
+        if (pendingBatch === "mount-all")
+            return "Montando todas las cuentas…";
+        if (pendingBatch === "unmount-all")
+            return "Desmontando todas las cuentas…";
         if (mounts.length === 0)
             return "Sin cuentas vinculadas";
         if (hasProblem)
@@ -275,6 +280,7 @@ PluginComponent {
     function runBatchAction(verb) {
         if (!actionsPath || actionProcess.running)
             return;
+        root.pendingBatch = verb;
         actionProcess.verb = verb;
         actionProcess.target = "";
         actionProcess.command = ["sh", actionsPath, verb];
@@ -334,7 +340,7 @@ PluginComponent {
             if (!line.trim())
                 continue;
             const fields = line.split("\t");
-            if (fields.length < 11)
+            if (fields.length !== 15)
                 continue;
             result.push({
                 unit: fields[0],
@@ -354,11 +360,14 @@ PluginComponent {
                 cachedFilesCount: Number(fields[14] || 0)
             });
         }
+        if (result.length === 0 && mounts.length > 0) {
+            // Transient empty output (e.g. systemd reloading): retain previous snapshot
+            return;
+        }
         result.sort((a, b) => (a.label || a.path).localeCompare(b.label || b.path));
         updateActivityHistory(result, previous);
         notifyStateChangesCheck(result, previous);
         mounts = result;
-        pendingUnits = ({});
         hasInitialSnapshot = true;
         lastRefresh = Qt.formatTime(new Date(), "hh:mm:ss");
     }
@@ -399,7 +408,7 @@ PluginComponent {
 
     Process {
         id: monitorProcess
-        command: root.monitorPath ? (root.showCache ? ["sh", root.monitorPath] : ["sh", root.monitorPath, "--no-cache"]) : ["true"]
+        command: root.monitorPath ? (root.showCache ? ["timeout", "7s", "sh", root.monitorPath] : ["timeout", "7s", "sh", root.monitorPath, "--no-cache"]) : ["true"]
 
         stdout: StdioCollector {
             id: monitorOutput
@@ -434,6 +443,15 @@ PluginComponent {
         stderr: StdioCollector { id: actionError; waitForEnd: true }
 
         onExited: exitCode => {
+            root.pendingBatch = "";
+            if (actionProcess.target) {
+                const nextPending = Object.assign({}, root.pendingUnits);
+                delete nextPending[actionProcess.target];
+                root.pendingUnits = nextPending;
+            } else {
+                root.pendingUnits = ({});
+            }
+
             if (exitCode !== 0) {
                 root.pendingUnits = ({});
                 const message = (actionError.text || actionOutput.text || "").trim().split("\n")[0];
@@ -555,7 +573,7 @@ PluginComponent {
             Row {
                 id: barContent
                 anchors.centerIn: parent
-                spacing: Theme.spacingXS
+                spacing: (root.showBarText && !!root.barText) ? Theme.spacingXS : 0
 
                 DankIcon {
                     name: {
@@ -576,6 +594,7 @@ PluginComponent {
 
                 StyledText {
                     visible: root.showBarText && !!root.barText
+                    width: (root.showBarText && !!root.barText) ? implicitWidth : 0
                     text: root.barText
                     color: Theme.surfaceText
                     font.pixelSize: Theme.fontSizeSmall
@@ -595,7 +614,7 @@ PluginComponent {
             Column {
                 id: barContent
                 anchors.centerIn: parent
-                spacing: Theme.spacingXS
+                spacing: (root.showBarText && !!root.barText) ? Theme.spacingXS : 0
 
                 DankIcon {
                     name: {
@@ -616,6 +635,8 @@ PluginComponent {
 
                 StyledText {
                     visible: root.showBarText && !!root.barText
+                    width: (root.showBarText && !!root.barText) ? implicitWidth : 0
+                    height: (root.showBarText && !!root.barText) ? implicitHeight : 0
                     text: root.barText
                     color: Theme.surfaceText
                     font.pixelSize: Theme.fontSizeSmall

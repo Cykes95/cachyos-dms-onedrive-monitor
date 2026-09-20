@@ -8,21 +8,23 @@ import os
 import sys
 import subprocess
 
-selected_paths = os.environ.get("NAUTILUS_SCRIPT_SELECTED_FILE_PATHS", "").strip().split("\n")
-if not selected_paths or selected_paths == [""]:
-    selected_paths = sys.argv[1:]
+raw_paths = os.environ.get("NAUTILUS_SCRIPT_SELECTED_FILE_PATHS", "")
+selected_paths = [p for p in raw_paths.splitlines() if p]
+if not selected_paths:
+    selected_paths = [p for p in sys.argv[1:] if p]
 
-if not selected_paths or selected_paths == [""]:
+if not selected_paths:
     sys.exit(0)
 
-cache_base = os.path.expanduser("~/.cache/onedriver")
-config_file = os.path.expanduser("~/.config/onedriver/config.yml")
+home_dir = os.path.expanduser("~")
+cache_base = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.join(home_dir, ".cache")), "onedriver")
+config_file = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.join(home_dir, ".config")), "onedriver/config.yml")
 if os.path.isfile(config_file):
     try:
         with open(config_file, "r", encoding="utf-8") as f:
             for line in f:
                 if line.strip().startswith("cacheDir:"):
-                    val = line.split(":", 1)[1].strip()
+                    val = line.split(":", 1)[1].strip().strip("\"'")
                     if val.startswith("~"):
                         cache_base = os.path.expanduser(val)
                     elif val.startswith("/"):
@@ -107,7 +109,6 @@ def get_db_items(db_path):
 freed_count = 0
 
 for target in selected_paths:
-    target = target.strip()
     if not target:
         continue
 

@@ -28,14 +28,15 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
     def __init__(self):
         super().__init__()
         self._sync_lock = threading.Lock()
-        self.cache_base = os.path.expanduser("~/.cache/onedriver")
-        config_file = os.path.expanduser("~/.config/onedriver/config.yml")
+        home_dir = os.path.expanduser("~")
+        self.cache_base = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.join(home_dir, ".cache")), "onedriver")
+        config_file = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.join(home_dir, ".config")), "onedriver/config.yml")
         if os.path.isfile(config_file):
             try:
                 with open(config_file, "r", encoding="utf-8") as f:
                     for line in f:
                         if line.strip().startswith("cacheDir:"):
-                            val = line.split(":", 1)[1].strip()
+                            val = line.split(":", 1)[1].strip().strip("\"'")
                             if val.startswith("~"):
                                 self.cache_base = os.path.expanduser(val)
                             elif val.startswith("/"):
@@ -108,7 +109,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
         active_cache_dirs = {m["cache_dir"] for m in active_mounts.values()}
         self.cached_ids = {k: v for k, v in self.cached_ids.items() if k in active_cache_dirs}
 
-    def _parse_db_file(self, db_path: str, mtime: float, mount_info: dict):
+    def _parse_db_file(self, db_path: str, mtime: float, mount_info: dict, file_to_invalidate=None):
         if not os.path.isfile(db_path) or os.path.getsize(db_path) == 0:
             mount_info["loading_db"] = False
             return
@@ -132,18 +133,27 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                 path_to_id[rel_path] = item_id
                 id_to_path[item_id] = rel_path
 
-            mount_info["mtime"] = mtime
-            mount_info["path_to_id"] = path_to_id
-            mount_info["id_to_path"] = id_to_path
-            cache_dir = mount_info.get("cache_dir")
-            if cache_dir:
-                self.cached_ids.pop(cache_dir, None)
+            def apply_snapshot():
+                mount_info["mtime"] = mtime
+                mount_info["path_to_id"] = path_to_id
+                mount_info["id_to_path"] = id_to_path
+                cache_dir = mount_info.get("cache_dir")
+                if cache_dir:
+                    self.cached_ids.pop(cache_dir, None)
+                if file_to_invalidate:
+                    try:
+                        file_to_invalidate.invalidate_extension_info()
+                    except Exception:
+                        pass
+                return False
+
+            GLib.idle_add(apply_snapshot)
         except Exception:
             pass
         finally:
             mount_info["loading_db"] = False
 
-    def _load_db_if_needed(self, mount_info: dict):
+    def _load_db_if_needed(self, mount_info: dict, file_to_invalidate=None):
         db_path = mount_info["db_path"]
         if not os.path.isfile(db_path) or os.path.getsize(db_path) == 0:
             return
@@ -153,13 +163,9 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
             if mtime <= mount_info.get("mtime", 0) and mount_info.get("path_to_id"):
                 return
 
-            if mount_info.get("path_to_id"):
-                if not mount_info.get("loading_db"):
-                    mount_info["loading_db"] = True
-                    threading.Thread(target=self._parse_db_file, args=(db_path, mtime, mount_info), daemon=True).start()
-                return
-
-            self._parse_db_file(db_path, mtime, mount_info)
+            if not mount_info.get("loading_db"):
+                mount_info["loading_db"] = True
+                threading.Thread(target=self._parse_db_file, args=(db_path, mtime, mount_info, file_to_invalidate), daemon=True).start()
         except Exception:
             pass
 
@@ -231,7 +237,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
             if not mp or not mount_info:
                 return Nautilus.OperationResult.COMPLETE
 
-            self._load_db_if_needed(mount_info)
+            self._load_db_if_needed(mount_info, file)
             cached_ids = self._get_cached_ids(mount_info)
 
             rel_path = "" if file_path == mp else os.path.relpath(file_path, mp)

@@ -10,11 +10,12 @@ import subprocess
 import mmap
 import re
 
-selected_paths = os.environ.get("NAUTILUS_SCRIPT_SELECTED_FILE_PATHS", "").strip().split("\n")
-if not selected_paths or selected_paths == [""]:
-    selected_paths = sys.argv[1:]
+raw_paths = os.environ.get("NAUTILUS_SCRIPT_SELECTED_FILE_PATHS", "")
+selected_paths = [p for p in raw_paths.splitlines() if p]
+if not selected_paths:
+    selected_paths = [p for p in sys.argv[1:] if p]
 
-if not selected_paths or selected_paths == [""]:
+if not selected_paths:
     sys.exit(0)
 
 home_dir = os.path.expanduser("~")
@@ -110,7 +111,6 @@ buf = bytearray(1024 * 1024)
 mv = memoryview(buf)
 
 for target in selected_paths:
-    target = target.strip()
     if not target:
         continue
 

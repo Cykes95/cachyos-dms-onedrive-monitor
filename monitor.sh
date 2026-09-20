@@ -7,8 +7,23 @@
 home_dir=${HOME:-$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)}
 config_file="${XDG_CONFIG_HOME:-$home_dir/.config}/onedriver/config.yml"
 cache_dir="${XDG_CACHE_HOME:-$home_dir/.cache}/onedriver"
-runtime_dir="${XDG_RUNTIME_DIR:-/tmp}/onedriver_dms"
-mkdir -p "$runtime_dir" 2>/dev/null || runtime_dir="/tmp"
+if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+    runtime_dir="$XDG_RUNTIME_DIR/onedriver_dms"
+else
+    runtime_dir="${TMPDIR:-/tmp}/onedriver_dms_${UID:-$(id -u)}"
+fi
+mkdir -p "$runtime_dir" 2>/dev/null
+chmod 700 "$runtime_dir" 2>/dev/null || true
+
+write_atomic() {
+    dest="$1"
+    tmp="${dest}.$$"
+    if printf '%s\n' "$2" > "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$dest" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    else
+        rm -f "$tmp" 2>/dev/null
+    fi
+}
 
 skip_cache_calc=0
 for arg in "$@"; do
@@ -52,7 +67,9 @@ emit_mount() {
     account_type="work"
     meta_cache_file="$runtime_dir/meta_${encoded}.tmp"
     if [ -r "$meta_cache_file" ]; then
-        if [ -f "$token_file" ] && [ "$token_file" -nt "$meta_cache_file" ]; then
+        if { [ -f "$token_file" ] && [ "$token_file" -nt "$meta_cache_file" ]; } || \
+           { [ -f "$label_file" ] && [ "$label_file" -nt "$meta_cache_file" ]; } || \
+           { [ -f "$cache_entry/onedriver.db" ] && [ "$cache_entry/onedriver.db" -nt "$meta_cache_file" ]; }; then
             rm -f "$meta_cache_file" 2>/dev/null || true
         else
             IFS='	' read -r label account account_type < "$meta_cache_file" 2>/dev/null || true
@@ -84,11 +101,19 @@ emit_mount() {
         [ -n "$label" ] || label="$mountpoint"
 
         # Authoritative driveType lookup directly from onedriver.db (from Microsoft Graph API)
+        account_type="work"
         if [ -f "$cache_entry/onedriver.db" ]; then
             dt=$(grep -m 1 -ao '"driveType":"[a-zA-Z]*"' "$cache_entry/onedriver.db" 2>/dev/null | head -n 1)
             case "$dt" in
                 *personal*) account_type="personal" ;;
                 *business*) account_type="work" ;;
+                *)
+                    case "$account" in
+                        *@outlook.*|*@hotmail.*|*@live.*|*@msn.*|*@passport.*)
+                            account_type="personal"
+                            ;;
+                    esac
+                    ;;
             esac
         else
             case "$account" in
@@ -99,7 +124,7 @@ emit_mount() {
         fi
 
         if [ -n "$label" ] && [ -n "$account" ]; then
-            printf '%s\t%s\t%s\n' "$label" "$account" "$account_type" > "$meta_cache_file" 2>/dev/null || true
+            write_atomic "$meta_cache_file" "$(printf '%s\t%s\t%s' "$label" "$account" "$account_type")"
         fi
     fi
 
@@ -164,7 +189,7 @@ PROP_EOF
             cache_bytes=$(du -sb "$cache_entry" 2>/dev/null | awk 'NR == 1 {print $1}')
             case "$cache_bytes" in
                 ''|*[!0-9]*) cache_bytes=0 ;;
-                *) printf '%s %s %s %s\n' "$now" "$cur_mtime" "$cur_db_sz" "$cache_bytes" > "$cache_size_file" 2>/dev/null || true ;;
+                *) write_atomic "$cache_size_file" "$now $cur_mtime $cur_db_sz $cache_bytes" ;;
             esac
         fi
 
@@ -188,7 +213,7 @@ Q_EOF
                 case "$q_s:$q_b:$q_a" in
                     *[!0-9:]*|:*|*::*) total_bytes=0; free_bytes=0 ;;
                     *) total_bytes=$((q_s * q_b)); free_bytes=$((q_s * q_a))
-                       printf '%s %s %s\n' "$now" "$total_bytes" "$free_bytes" > "$quota_cache_file" 2>/dev/null || true
+                       write_atomic "$quota_cache_file" "$now $total_bytes $free_bytes"
                        ;;
                 esac
             fi
@@ -209,7 +234,7 @@ Q_EOF
             fi
             if [ "$recount" -eq 1 ]; then
                 cached_files_count=$(find "$content_dir" -maxdepth 1 -type f 2>/dev/null | wc -l || echo 0)
-                printf '%s %s\n' "$dir_mtime" "$cached_files_count" > "$cnt_cache_file" 2>/dev/null || true
+                write_atomic "$cnt_cache_file" "$dir_mtime $cached_files_count"
             fi
         fi
     fi
@@ -233,7 +258,7 @@ Q_EOF
                 | tr '\t\r\n' ' ' \
                 | sed -E 's/\x1B\[[0-9;]*[[:alpha:]]//g' \
                 | sed 's/[[:space:]][[:space:]]*/ /g')
-            printf '%s %s\n' "$now" "$activity" > "$act_cache_file" 2>/dev/null || true
+            write_atomic "$act_cache_file" "$now $activity"
         fi
     fi
 
