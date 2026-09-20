@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""
+Nautilus Script: Liberar espacio local de OneDrive
+Permite seleccionar uno o varios archivos/carpetas en Nautilus y liberar su espacio local.
+"""
+
+import os
+import sys
+import subprocess
+
+selected_paths = os.environ.get("NAUTILUS_SCRIPT_SELECTED_FILE_PATHS", "").strip().split("\n")
+if not selected_paths or selected_paths == [""]:
+    selected_paths = sys.argv[1:]
+
+if not selected_paths or selected_paths == [""]:
+    sys.exit(0)
+
+cache_base = os.path.expanduser("~/.cache/onedriver")
+if not os.path.isdir(cache_base):
+    sys.exit(0)
+
+# Discovered mounts
+mounts = {}
+for name in os.listdir(cache_base):
+    if name in ("CacheStorage", "WebKitCache"):
+        continue
+    cp = os.path.join(cache_base, name)
+    token = os.path.join(cp, "auth_tokens.json")
+    if os.path.isdir(cp) and os.path.isfile(token):
+        try:
+            mp = subprocess.check_output(["systemd-escape", "--unescape", "--path", name], text=True).strip()
+            if os.path.isdir(mp):
+                mounts[mp] = {
+                    "cache_dir": cp,
+                    "content_dir": os.path.join(cp, "content"),
+                    "db_path": os.path.join(cp, "onedriver.db")
+                }
+        except Exception:
+            pass
+
+import re
+freed_count = 0
+
+for target in selected_paths:
+    target = target.strip()
+    if not target:
+        continue
+
+    # Find matching mount
+    matched_mp = None
+    matched_info = None
+    for mp, info in mounts.items():
+        if target == mp or target.startswith(mp + "/"):
+            matched_mp = mp
+            matched_info = info
+            break
+
+    if not matched_mp:
+        continue
+
+    content_dir = matched_info["content_dir"]
+    db_path = matched_info["db_path"]
+    if not os.path.isdir(content_dir) or not os.path.isfile(db_path):
+        continue
+
+    rel_path = os.path.relpath(target, matched_mp)
+    if rel_path == ".":
+        continue
+
+    try:
+        with open(db_path, "rb") as f:
+            raw = f.read()
+
+        pattern = re.compile(rb'\{"id":"([A-Za-z0-9!_-]+)","name":"([^"]+)".*?"parentReference":\{.*?"path":"([^"]*)"', re.DOTALL)
+        matches = pattern.findall(raw)
+
+        is_dir = os.path.isdir(target)
+        target_prefix = rel_path + "/"
+
+        for item_id_b, name_b, parent_b in matches:
+            clean_parent = parent_b.decode("utf-8", errors="ignore").replace("/drive/root:", "")
+            clean_name = name_b.decode("utf-8", errors="ignore")
+            item_rel = os.path.normpath(os.path.join(clean_parent.lstrip("/"), clean_name))
+
+            should_free = False
+            if is_dir and item_rel.startswith(target_prefix):
+                should_free = True
+            elif not is_dir and item_rel == rel_path:
+                should_free = True
+
+            if should_free:
+                item_id = item_id_b.decode("utf-8", errors="ignore")
+                cached_file = os.path.join(content_dir, item_id)
+                if os.path.isfile(cached_file):
+                    try:
+                        os.remove(cached_file)
+                        freed_count += 1
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+if freed_count > 0:
+    msg = f"Se ha liberado el espacio local de {freed_count} archivo(s)."
+else:
+    msg = "Los elementos seleccionados ya estaban solo en la nube."
+
+try:
+    subprocess.run(["notify-send", "-a", "OneDrive", "-i", "onedrive-custom-cloud", "Espacio liberado", msg])
+except Exception:
+    pass

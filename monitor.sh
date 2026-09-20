@@ -1,6 +1,7 @@
 #!/bin/sh
 
 # Read-only discovery helper for the OneDrive Monitor DMS plugin.
+# Highly optimized: single-pass systemd status, cached quota & size lookups, zero disk churn.
 # Output is tab-separated and intentionally contains no credentials or tokens.
 
 home_dir=${HOME:-$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)}
@@ -29,7 +30,6 @@ emit_mount() {
         *) return 0 ;;
     esac
 
-    # Filter out ghost/orphaned units that have neither a mount directory nor a cache entry
     unit="onedriver@${encoded}.service"
     cache_entry="$cache_dir/$encoded"
     if [ ! -d "$mountpoint" ] && [ ! -d "$cache_entry" ]; then
@@ -50,13 +50,24 @@ emit_mount() {
             ;;
     esac
 
-    active=$(systemctl --user is-active "$unit" 2>/dev/null || true)
-    sub_state=$(systemctl --user show "$unit" --property=SubState --value 2>/dev/null || true)
-    enabled=$(systemctl --user is-enabled "$unit" 2>/dev/null || true)
-    case "$enabled" in
-        enabled*) enabled="enabled" ;;
-        *) enabled="disabled" ;;
-    esac
+    # Optimization: Query ActiveState, SubState and UnitFileState in a single systemctl fork
+    active="inactive"
+    sub_state="dead"
+    enabled="disabled"
+    while IFS='=' read -r k v; do
+        case "$k" in
+            ActiveState) active="$v" ;;
+            SubState) sub_state="$v" ;;
+            UnitFileState)
+                case "$v" in
+                    enabled*) enabled="enabled" ;;
+                    *) enabled="disabled" ;;
+                esac
+                ;;
+        esac
+    done <<PROP_EOF
+$(systemctl --user show "$unit" --property=ActiveState,SubState,UnitFileState 2>/dev/null)
+PROP_EOF
 
     filesystem=$(findmnt -M "$mountpoint" --noheadings --output FSTYPE 2>/dev/null || true)
     mounted=0
@@ -64,7 +75,7 @@ emit_mount() {
         fuse*|onedriver) mounted=1 ;;
     esac
 
-    # Cache size check optimization: avoid running du -sb on every poll tick
+    # Optimization: Cache size lookup with 30-second TTL
     cache_bytes=0
     cache_size_file="/tmp/onedriver_cache_${encoded}.tmp"
     if [ -r "$cache_size_file" ]; then
@@ -81,25 +92,63 @@ emit_mount() {
         esac
     fi
 
-    quota_block=$(stat -f -c '%S' "$mountpoint" 2>/dev/null || echo 0)
-    quota_blocks=$(stat -f -c '%b' "$mountpoint" 2>/dev/null || echo 0)
-    quota_free_blocks=$(stat -f -c '%a' "$mountpoint" 2>/dev/null || echo 0)
-    case "$quota_block:$quota_blocks:$quota_free_blocks" in
-        *[!0-9:]*|:*|*::*) total_bytes=0; free_bytes=0 ;;
-        *) total_bytes=$((quota_block * quota_blocks)); free_bytes=$((quota_block * quota_free_blocks)) ;;
-    esac
+    # Optimization: Single stat -f call with 60-second TTL
+    total_bytes=0
+    free_bytes=0
+    if [ "$mounted" -eq 1 ]; then
+        quota_cache_file="/tmp/onedriver_quota_${encoded}.tmp"
+        read_quota=1
+        if [ -r "$quota_cache_file" ]; then
+            read -r q_ts q_tot q_free < "$quota_cache_file" 2>/dev/null || true
+            if [ -n "$q_ts" ] && [ "$((now - q_ts))" -lt 60 ] && [ -n "$q_tot" ]; then
+                total_bytes="$q_tot"
+                free_bytes="$q_free"
+                read_quota=0
+            fi
+        fi
+        if [ "$read_quota" -eq 1 ]; then
+            quota_stats=$(stat -f -c '%S %b %a' "$mountpoint" 2>/dev/null || echo "0 0 0")
+            read -r q_s q_b q_a <<Q_EOF
+$quota_stats
+Q_EOF
+            case "$q_s:$q_b:$q_a" in
+                *[!0-9:]*|:*|*::*) total_bytes=0; free_bytes=0 ;;
+                *) total_bytes=$((q_s * q_b)); free_bytes=$((q_s * q_a))
+                   printf '%s %s %s\n' "$now" "$total_bytes" "$free_bytes" > "$quota_cache_file" 2>/dev/null || true
+                   ;;
+            esac
+        fi
+    fi
 
-    # journalctl optimization: limit to last 25 lines
-    activity=$(journalctl --user -u "$unit" --since "5 minutes ago" -n 25 --no-pager --quiet -o cat 2>/dev/null \
-        | grep -Ei 'uploading|uploaded|download|offline|online|retry|failed|error' \
-        | tail -n 1 \
-        | tr '\t\r\n' ' ' \
-        | sed -E 's/\x1B\[[0-9;]*[[:alpha:]]//g' \
-        | sed 's/[[:space:]][[:space:]]*/ /g')
+    # Optimization: Only run journalctl if service is active
+    activity=""
+    if [ "$active" = "active" ]; then
+        activity=$(journalctl --user -u "$unit" --since "5 minutes ago" -n 25 --no-pager --quiet -o cat 2>/dev/null \
+            | grep -Ei 'uploading|uploaded|download|offline|online|retry|failed|error' \
+            | tail -n 1 \
+            | tr '\t\r\n' ' ' \
+            | sed -E 's/\x1B\[[0-9;]*[[:alpha:]]//g' \
+            | sed 's/[[:space:]][[:space:]]*/ /g')
+    fi
 
+    # Optimization: Count files by content directory mtime
     cached_files_count=0
-    if [ -d "$cache_entry/content" ]; then
-        cached_files_count=$(find "$cache_entry/content" -maxdepth 1 -type f 2>/dev/null | wc -l || echo 0)
+    content_dir="$cache_entry/content"
+    if [ -d "$content_dir" ]; then
+        cnt_cache_file="/tmp/onedriver_cnt_${encoded}.tmp"
+        dir_mtime=$(stat -c %Y "$content_dir" 2>/dev/null || echo 0)
+        recount=1
+        if [ -r "$cnt_cache_file" ]; then
+            read -r last_mtime last_cnt < "$cnt_cache_file" 2>/dev/null || true
+            if [ "$last_mtime" = "$dir_mtime" ] && [ -n "$last_cnt" ]; then
+                cached_files_count="$last_cnt"
+                recount=0
+            fi
+        fi
+        if [ "$recount" -eq 1 ]; then
+            cached_files_count=$(find "$content_dir" -maxdepth 1 -type f 2>/dev/null | wc -l || echo 0)
+            printf '%s %s\n' "$dir_mtime" "$cached_files_count" > "$cnt_cache_file" 2>/dev/null || true
+        fi
     fi
 
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -113,18 +162,12 @@ loaded_units=$(systemctl --user list-units --all --no-legend --no-pager 'onedriv
     | awk '$1 ~ /^onedriver@/ {print $1}' \
     | sed -n 's/^onedriver@\(.*\)\.service$/\1/p')
 
-file_units=$(systemctl --user list-unit-files --no-legend --no-pager 'onedriver@*.service' 2>/dev/null \
-    | awk '$1 ~ /^onedriver@.+\.service/ {print $1}' \
-    | sed -n 's/^onedriver@\(.*\)\.service$/\1/p')
-
 wants_units=""
 if [ -d "$home_dir/.config/systemd/user/default.target.wants" ]; then
     wants_units=$(find "$home_dir/.config/systemd/user/default.target.wants" -maxdepth 1 -name 'onedriver@*.service' 2>/dev/null \
         | sed -n 's/.*onedriver@\(.*\)\.service$/\1/p')
 fi
 
-# Discover configured mounts directly from cache directories containing auth_tokens.json
-# (Safely avoiding directories like CacheStorage and WebKitCache without pruning valid paths)
 cache_units=""
 if [ -d "$cache_dir" ]; then
     for d in "$cache_dir"/*; do
@@ -134,7 +177,7 @@ if [ -d "$cache_dir" ]; then
     done
 fi
 
-printf '%s\n%s\n%s\n%b\n' "$loaded_units" "$file_units" "$wants_units" "$cache_units" \
+printf '%s\n%s\n%b\n' "$loaded_units" "$wants_units" "$cache_units" \
     | sed '/^[[:space:]]*$/d' \
     | sort -u \
     | while IFS= read -r encoded; do emit_mount "$encoded"; done

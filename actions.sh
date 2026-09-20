@@ -6,6 +6,7 @@
 home_dir=${HOME:-$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)}
 config_file="$home_dir/.config/onedriver/config.yml"
 cache_dir="$home_dir/.cache/onedriver"
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 
 if [ -r "$config_file" ]; then
     configured_cache=$(sed -n 's/^[[:space:]]*cacheDir:[[:space:]]*//p' "$config_file" | head -n 1)
@@ -155,8 +156,71 @@ case "$cmd" in
             exit 1
         fi
         ;;
+    install-nautilus)
+        icons_dir="$home_dir/.local/share/icons/hicolor"
+        ext_dir="$home_dir/.local/share/nautilus-python/extensions"
+        scripts_dir="$home_dir/.local/share/nautilus/scripts"
+
+        mkdir -p "$icons_dir/scalable/emblems" "$icons_dir/48x48/emblems" "$ext_dir" "$scripts_dir"
+
+        if [ -d "$script_dir/assets/emblems" ]; then
+            cp -f "$script_dir/assets/emblems"/*.svg "$icons_dir/scalable/emblems/" 2>/dev/null || true
+            cp -f "$script_dir/assets/emblems"/*.svg "$icons_dir/48x48/emblems/" 2>/dev/null || true
+        fi
+
+        if [ -f "$script_dir/integrations/nautilus/onedrive_extension.py" ]; then
+            cp -f "$script_dir/integrations/nautilus/onedrive_extension.py" "$ext_dir/" 2>/dev/null || true
+        fi
+
+        if [ -f "$script_dir/integrations/nautilus/OneDrive - Liberar espacio local" ]; then
+            cp -f "$script_dir/integrations/nautilus/OneDrive - Liberar espacio local" "$scripts_dir/" 2>/dev/null || true
+            chmod +x "$scripts_dir/OneDrive - Liberar espacio local" 2>/dev/null || true
+        fi
+
+        if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+            gtk-update-icon-cache -f -t "$icons_dir" 2>/dev/null || true
+        fi
+
+        case "$1" in
+            --restart|-r)
+                if pgrep -x nautilus >/dev/null 2>&1; then
+                    nautilus -q 2>/dev/null || true
+                fi
+                ;;
+        esac
+
+        echo "nautilus integration installed"
+        exit 0
+        ;;
+    uninstall-nautilus)
+        ext_dir="$home_dir/.local/share/nautilus-python/extensions"
+        scripts_dir="$home_dir/.local/share/nautilus/scripts"
+        rm -f "$ext_dir/onedrive_extension.py" 2>/dev/null || true
+        rm -f "$scripts_dir/OneDrive - Liberar espacio local" 2>/dev/null || true
+        if pgrep -x nautilus >/dev/null 2>&1; then
+            nautilus -q 2>/dev/null || true
+        fi
+        echo "nautilus integration uninstalled"
+        exit 0
+        ;;
+    restart-nautilus)
+        if pgrep -x nautilus >/dev/null 2>&1; then
+            nautilus -q 2>/dev/null || true
+        fi
+        echo "nautilus restarted"
+        exit 0
+        ;;
+    status-nautilus)
+        ext_dir="$home_dir/.local/share/nautilus-python/extensions"
+        if [ -f "$ext_dir/onedrive_extension.py" ]; then
+            echo "installed"
+        else
+            echo "not-installed"
+        fi
+        exit 0
+        ;;
     *)
-        echo "Usage: actions.sh {start|stop|restart|enable|disable|toggle-autostart|mount-all|unmount-all|clear-cache|remove-mount|open-launcher} [target]" >&2
+        echo "Usage: actions.sh {start|stop|restart|enable|disable|toggle-autostart|mount-all|unmount-all|clear-cache|remove-mount|open-launcher|install-nautilus|uninstall-nautilus|restart-nautilus|status-nautilus} [target]" >&2
         exit 1
         ;;
 esac

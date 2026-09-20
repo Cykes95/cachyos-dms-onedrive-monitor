@@ -54,6 +54,52 @@ PluginSettings {
     }
 
     SettingsCard {
+        title: "Integración con Nautilus (Explorador de Archivos)"
+        iconName: "folder_shared"
+
+        StyledText {
+            width: parent.width
+            wrapMode: Text.WordWrap
+            text: "Integra emblemas visuales de estado (en la nube vs. descargado) y opciones contextuales del ratón (Liberar espacio local / Descargar en este equipo) directamente en el explorador de archivos Nautilus."
+            color: Theme.surfaceVariantText
+            font.pixelSize: Theme.fontSizeSmall
+        }
+
+        ToggleSetting {
+            settingKey: "enableNautilus"
+            label: "Habilitar integración con Nautilus"
+            description: "Muestra los emblemas en archivos y añade las acciones al menú contextual"
+            defaultValue: true
+        }
+
+        Row {
+            spacing: Theme.spacingS
+
+            DankButton {
+                text: "Reinstalar / Sincronizar integración"
+                iconName: "sync"
+                onClicked: {
+                    const home = Quickshell.env("HOME") || "";
+                    const actionScript = home + "/.config/DankMaterialShell/plugins/OneDriveMonitor/actions.sh";
+                    Quickshell.execDetached(["sh", actionScript, "install-nautilus", "--restart"]);
+                    ToastService.showInfo("Integración con Nautilus actualizada y reiniciada");
+                }
+            }
+
+            DankActionButton {
+                iconName: "refresh"
+                tooltipText: "Reiniciar Nautilus"
+                onClicked: {
+                    const home = Quickshell.env("HOME") || "";
+                    const actionScript = home + "/.config/DankMaterialShell/plugins/OneDriveMonitor/actions.sh";
+                    Quickshell.execDetached(["sh", actionScript, "restart-nautilus"]);
+                    ToastService.showInfo("Nautilus reiniciado");
+                }
+            }
+        }
+    }
+
+    SettingsCard {
         title: "Gestión de Cuentas"
         iconName: "manage_accounts"
 

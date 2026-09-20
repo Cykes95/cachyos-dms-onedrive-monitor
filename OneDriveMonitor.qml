@@ -18,14 +18,29 @@ PluginComponent {
     property bool hasInitialSnapshot: false
     property var activityHistory: []
     property var pendingUnits: ({})
+    property bool popoutVisible: false
 
     readonly property int pollIntervalMs: {
-        const seconds = Number((pluginData && pluginData.pollSeconds) || 5);
-        return Math.max(2000, Math.min(30000, (isNaN(seconds) ? 5 : seconds) * 1000));
+        if (popoutVisible)
+            return 2500;
+        if (transferCount > 0)
+            return 4000;
+        const seconds = Number((pluginData && pluginData.pollSeconds) || 10);
+        return Math.max(5000, Math.min(60000, (isNaN(seconds) ? 10 : seconds) * 1000));
     }
     readonly property bool showCache: !pluginData || pluginData.showCache === undefined || pluginData.showCache === true || pluginData.showCache === "true"
     readonly property bool showInactive: !pluginData || pluginData.showInactive === undefined || pluginData.showInactive === true || pluginData.showInactive === "true"
     readonly property bool notifyStateChanges: !pluginData || pluginData.notifyStateChanges === undefined || pluginData.notifyStateChanges === true || pluginData.notifyStateChanges === "true"
+    readonly property bool enableNautilus: !pluginData || pluginData.enableNautilus === undefined || pluginData.enableNautilus === true || pluginData.enableNautilus === "true"
+
+    onEnableNautilusChanged: {
+        if (!actionsPath) return;
+        if (enableNautilus) {
+            Quickshell.execDetached(["sh", actionsPath, "install-nautilus", "--restart"]);
+        } else {
+            Quickshell.execDetached(["sh", actionsPath, "uninstall-nautilus"]);
+        }
+    }
 
     readonly property string monitorPath: {
         const home = Quickshell.env("HOME") || "";
@@ -166,14 +181,15 @@ PluginComponent {
                 mountStatus(mount),
                 "Inicio auto: " + (mount.enabled === "enabled" ? "activado" : "desactivado"),
                 mount.path,
-                "Caché: " + formatBytes(mount.cacheBytes),
+                "Caché: " + formatBytes(mount.cacheBytes) + " (" + (mount.cachedFilesCount || 0) + " archivos descargados)",
                 mount.activity || "sin actividad reciente"
             ].join(" · ");
         });
         let reportParts = [
             "=== OneDrive Monitor Diagnostic Report ===",
             "Fecha: " + new Date().toLocaleString(),
-            "Total cuentas: " + mounts.length + " (Activas: " + activeCount + ")"
+            "Total cuentas: " + mounts.length + " (Activas: " + activeCount + ")",
+            "Integración Nautilus: " + (root.enableNautilus ? "Habilitada" : "Deshabilitada")
         ];
         if (root.lastError) {
             reportParts.push("Error de sondeo: " + root.lastError);
@@ -340,7 +356,12 @@ PluginComponent {
         lastRefresh = Qt.formatTime(new Date(), "hh:mm:ss");
     }
 
-    Component.onCompleted: refresh()
+    Component.onCompleted: {
+        refresh();
+        if (enableNautilus && actionsPath) {
+            Quickshell.execDetached(["sh", actionsPath, "install-nautilus"]);
+        }
+    }
 
     Timer {
         interval: root.pollIntervalMs
@@ -558,6 +579,13 @@ PluginComponent {
 
     popoutContent: Component {
         PopoutComponent {
+            Component.onCompleted: {
+                root.popoutVisible = true;
+                root.refresh();
+            }
+            Component.onDestruction: {
+                root.popoutVisible = false;
+            }
             headerText: "OneDrive"
             detailsText: root.lastError ? root.lastError : root.summary
             showCloseButton: true
