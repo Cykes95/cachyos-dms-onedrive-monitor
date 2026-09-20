@@ -1,4 +1,4 @@
-# OneDrive Monitor (v1.0.4)
+# OneDrive Monitor (v1.0.5)
 
 DankMaterialShell widget for [onedriver](https://github.com/jstaf/onedriver).
 

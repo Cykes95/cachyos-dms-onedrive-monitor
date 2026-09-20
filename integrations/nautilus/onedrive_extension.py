@@ -42,7 +42,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
         super().__init__()
         self._sync_lock = threading.Lock()
         self._active_files_lock = threading.Lock()
-        self._active_files = weakref.WeakValueDictionary()  # file_path -> weakref to Nautilus.FileInfo
+        self._active_files = {}  # file_path -> Nautilus.FileInfo
         self.cache_base = onedrive_core.get_cache_base()
         self.mounts = {}
         self.last_mount_check = 0
@@ -56,6 +56,9 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
     def _register_active_file(self, file_path: str, file_info: Nautilus.FileInfo):
         with self._active_files_lock:
             self._active_files[file_path] = file_info
+            if len(self._active_files) > 4000:
+                for k in list(self._active_files.keys())[:2000]:
+                    del self._active_files[k]
 
     def _invalidate_active_files_for_mount(self, mp: str):
         with self._active_files_lock:
@@ -209,6 +212,24 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
             if not need_db_reload and not need_content_refresh:
                 return
 
+            # Synchronous fast-path on initial load:
+            # Read metadata only (content_dir=None, NO hash computation, no freeze)
+            # so the very first Nautilus render receives emblems immediately!
+            if mount_info.get("snapshot") is None:
+                try:
+                    snapshot = onedrive_core.read_bbolt_db(db_path, None)
+                    if snapshot and snapshot.get("read_success"):
+                        mount_info["snapshot"] = snapshot
+                        mount_info["mtime"] = db_mtime
+                        mount_info["content_mtime"] = 0
+                        mount_info["txid"] = snapshot.get("txid", 0)
+                        mount_info["db_ready"] = True
+                        mount_info["last_error_time"] = 0
+                        need_db_reload = False
+                        need_content_refresh = True
+                except Exception:
+                    pass
+
             if mount_info["loading_db"]:
                 mount_info["content_dirty"] = True
                 # Only register interested FileInfo when a load is actively occurring
@@ -291,14 +312,12 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                     to_invalidate = list(mount_info["pending_invalidation"])
                     mount_info["pending_invalidation"].clear()
 
-                if invalidate_all_active:
-                    self._invalidate_active_files_for_mount(mount_info.get("mp", ""))
-                else:
-                    for f in to_invalidate:
-                        try:
-                            f.invalidate_extension_info()
-                        except Exception:
-                            pass
+                self._invalidate_active_files_for_mount(mount_info.get("mp", ""))
+                for f in to_invalidate:
+                    try:
+                        f.invalidate_extension_info()
+                    except Exception:
+                        pass
                 return False
 
             GLib.idle_add(apply_snapshot)

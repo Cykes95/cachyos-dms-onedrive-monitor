@@ -225,6 +225,43 @@ def test_large_cache_performance():
     print(f"PASS ({elapsed_ms:.2f}ms)")
 
 
+def test_extension_invalidation_and_bounded_active_files():
+    print("Running test_extension_invalidation_and_bounded_active_files...", end=" ")
+    import onedrive_extension
+
+    ext = onedrive_extension.OneDriveExtension()
+    invalidated = []
+
+    class MockFileInfo:
+        def __init__(self, path):
+            self.path = path
+        def invalidate_extension_info(self):
+            invalidated.append(self.path)
+
+    # Register files under /home/test/mount
+    mp = "/home/test/mount"
+    f1 = MockFileInfo(f"{mp}/file1.txt")
+    f2 = MockFileInfo(f"{mp}/sub/file2.txt")
+    f_other = MockFileInfo("/home/other/file.txt")
+
+    ext._register_active_file(f1.path, f1)
+    ext._register_active_file(f2.path, f2)
+    ext._register_active_file(f_other.path, f_other)
+
+    assert len(ext._active_files) == 3
+    ext._invalidate_active_files_for_mount(mp)
+
+    assert f1.path in invalidated
+    assert f2.path in invalidated
+    assert f_other.path not in invalidated
+
+    # Test bounding: registering > 4000 files prunes back to ~2000
+    for i in range(4005):
+        ext._register_active_file(f"/dummy/{i}", MockFileInfo(f"/dummy/{i}"))
+    assert len(ext._active_files) <= 2010, f"Expected bounded active_files <= 2010, got {len(ext._active_files)}"
+    print("PASS")
+
+
 if __name__ == "__main__":
     print("=== Running OneDriveMonitor Reliability Test Suite ===")
     test_quickxorhash_vector()
@@ -235,4 +272,5 @@ if __name__ == "__main__":
     test_content_dirty_coalescing()
     test_clear_cache_with_dotfiles()
     test_large_cache_performance()
-    print("=== All 8 Reliability Tests PASSED successfully! ===")
+    test_extension_invalidation_and_bounded_active_files()
+    print("=== All 9 Reliability Tests PASSED successfully! ===")
