@@ -9,6 +9,9 @@ PluginSettings {
     id: settingsRoot
     pluginId: "onedriverMonitor"
 
+    readonly property string pluginPath: String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "").replace(/\/+$/, "")
+    readonly property string actionsPath: pluginPath + "/actions.sh"
+
     SettingsCard {
         title: "Comportamiento y Monitoreo"
         iconName: "tune"
@@ -86,9 +89,7 @@ PluginSettings {
                 text: "Reinstalar / Sincronizar integración"
                 iconName: "sync"
                 onClicked: {
-                    const home = Quickshell.env("HOME") || "";
-                    const actionScript = home + "/.config/DankMaterialShell/plugins/OneDriveMonitor/actions.sh";
-                    Quickshell.execDetached(["sh", actionScript, "install-nautilus", "--restart"]);
+                    Quickshell.execDetached(["sh", settingsRoot.actionsPath, "install-nautilus", "--restart"]);
                     ToastService.showInfo("Integración con Nautilus actualizada y reiniciada");
                 }
             }
@@ -97,9 +98,7 @@ PluginSettings {
                 iconName: "refresh"
                 tooltipText: "Reiniciar Nautilus"
                 onClicked: {
-                    const home = Quickshell.env("HOME") || "";
-                    const actionScript = home + "/.config/DankMaterialShell/plugins/OneDriveMonitor/actions.sh";
-                    Quickshell.execDetached(["sh", actionScript, "restart-nautilus"]);
+                    Quickshell.execDetached(["sh", settingsRoot.actionsPath, "restart-nautilus"]);
                     ToastService.showInfo("Nautilus reiniciado");
                 }
             }
@@ -125,9 +124,7 @@ PluginSettings {
                 text: "Añadir o gestionar cuentas"
                 iconName: "open_in_new"
                 onClicked: {
-                    const home = Quickshell.env("HOME") || "";
-                    const actionScript = home + "/.config/DankMaterialShell/plugins/OneDriveMonitor/actions.sh";
-                    Quickshell.execDetached(["sh", actionScript, "open-launcher"]);
+                    Quickshell.execDetached(["sh", settingsRoot.actionsPath, "open-launcher"]);
                 }
             }
 

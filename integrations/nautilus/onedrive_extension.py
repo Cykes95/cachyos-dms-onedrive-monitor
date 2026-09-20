@@ -184,7 +184,8 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
 
     def _match_mount(self, file_path: str):
         self._refresh_mounts()
-        for mp, info in self.mounts.items():
+        for mp in sorted(self.mounts.keys(), key=len, reverse=True):
+            info = self.mounts[mp]
             if file_path == mp or file_path.startswith(mp + "/"):
                 return mp, info
         return None, None
@@ -221,9 +222,10 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
             if file.is_directory():
                 has_cached = rel_path in mount_info.get("cached_folders", set())
                 has_cloud = rel_path in mount_info.get("cloud_folders", set())
-                if has_cached:
+                # Only mark folder as completely synced if all its contents are cached locally
+                if has_cached and not has_cloud:
                     file.add_emblem("onedrive-custom-synced")
-                elif has_cloud:
+                elif has_cloud or has_cached:
                     file.add_emblem("onedrive-custom-cloud")
             else:
                 # For files
@@ -295,15 +297,16 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
             item_free.connect("activate", self._on_free_space_activate, onedrive_files)
             menu_items.append(item_free)
 
-        # Option: Keep always on this device / Download now
-        item_download = Nautilus.MenuItem(
-            name="OneDrive::DownloadNow",
-            label="OneDrive: Descargar en este equipo",
-            tip="Descarga una copia local completa para usar sin conexión",
-            icon="onedrive-custom-synced"
-        )
-        item_download.connect("activate", self._on_download_activate, onedrive_files)
-        menu_items.append(item_download)
+        # Option: Keep always on this device / Download now (if any selected item is not yet fully downloaded)
+        if has_cloud:
+            item_download = Nautilus.MenuItem(
+                name="OneDrive::DownloadNow",
+                label="OneDrive: Descargar en este equipo",
+                tip="Descarga una copia local completa para usar sin conexión",
+                icon="onedrive-custom-synced"
+            )
+            item_download.connect("activate", self._on_download_activate, onedrive_files)
+            menu_items.append(item_download)
 
         return menu_items
 
@@ -373,6 +376,8 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
             with self.download_lock:
                 downloaded = 0
                 affected_mounts = set()
+                buf = bytearray(1024 * 1024)
+                mv = memoryview(buf)
                 try:
                     for file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded in targets_to_download:
                         affected_mounts.add(mount_info.get("cache_dir"))
@@ -382,7 +387,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                                     fp = os.path.join(root_dir, fn)
                                     try:
                                         with open(fp, "rb") as f:
-                                            while f.read(1024 * 1024):
+                                            while f.readinto(mv):
                                                 pass
                                         downloaded += 1
                                     except Exception:
@@ -390,7 +395,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                         else:
                             try:
                                 with open(file_path, "rb") as f:
-                                    while f.read(1024 * 1024):
+                                    while f.readinto(mv):
                                         pass
                                 downloaded += 1
                             except Exception:

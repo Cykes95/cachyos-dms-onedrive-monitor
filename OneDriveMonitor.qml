@@ -410,6 +410,7 @@ PluginComponent {
 
         onExited: exitCode => {
             if (exitCode !== 0) {
+                root.pendingUnits = ({});
                 const message = (actionError.text || actionOutput.text || "").trim().split("\n")[0];
                 root.lastActionError = "Fallo en acción '" + actionProcess.verb + "': " + (message || ("código " + exitCode));
                 ToastService.showError("OneDrive", message || ("Error al ejecutar " + actionProcess.verb));
@@ -680,7 +681,7 @@ PluginComponent {
                 }
 
                 // Mount Cards Scrollable Area
-                Flickable {
+                DankFlickable {
                     width: parent.width
                     height: Math.max(100, root.popoutHeight - 160)
                     contentWidth: width

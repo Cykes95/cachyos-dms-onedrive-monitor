@@ -43,8 +43,18 @@ normalize_encoded() {
     esac
 }
 
+ensure_systemd_override() {
+    systemd_override_dir="$home_dir/.config/systemd/user/onedriver@.service.d"
+    if [ ! -f "$systemd_override_dir/override.conf" ]; then
+        mkdir -p "$systemd_override_dir" 2>/dev/null || true
+        printf '[Service]\nExecStopPost=\nExecStopPost=-/usr/bin/fusermount3 -uz /%%I\n' > "$systemd_override_dir/override.conf" 2>/dev/null || true
+        systemctl --user daemon-reload 2>/dev/null || true
+    fi
+}
+
 cmd="$1"
 shift 1 2>/dev/null || true
+ensure_systemd_override
 
 case "$cmd" in
     start)
@@ -153,7 +163,7 @@ case "$cmd" in
         fi
         content_dir="$cache_dir/$encoded/content"
         if [ -d "$content_dir" ]; then
-            rm -rf "$content_dir"/* 2>/dev/null || true
+            find "$content_dir" -mindepth 1 -delete 2>/dev/null || rm -rf "$content_dir"/* 2>/dev/null || true
         fi
         # Remove onedriver.db to compact metadata and reset cache size completely
         rm -f "$cache_dir/$encoded/onedriver.db" 2>/dev/null || true
@@ -168,8 +178,12 @@ case "$cmd" in
     remove-mount)
         encoded=$(normalize_encoded "$1")
         unit="onedriver@${encoded}.service"
+        mountpoint=$(systemd-escape --unescape --path "$encoded" 2>/dev/null || true)
         systemctl --user stop "$unit" 2>/dev/null || true
         systemctl --user disable "$unit" 2>/dev/null || true
+        if [ -n "$mountpoint" ] && command -v fusermount3 >/dev/null 2>&1; then
+            fusermount3 -uz "$mountpoint" 2>/dev/null || true
+        fi
         rm -rf "$cache_dir/$encoded" 2>/dev/null || true
         rm -f /tmp/onedriver_*_"${encoded}.tmp" 2>/dev/null || true
         echo "removed mount $encoded"

@@ -90,7 +90,11 @@ $(systemctl --user show "$unit" --property=ActiveState,SubState,UnitFileState 2>
 PROP_EOF
 
     mounted=0
-    if [ -r /proc/mounts ] && grep -Fqs " $mountpoint " /proc/mounts; then
+    if command -v findmnt >/dev/null 2>&1; then
+        if findmnt -rn -o TARGET "$mountpoint" >/dev/null 2>&1; then
+            mounted=1
+        fi
+    elif [ -r /proc/mounts ] && grep -Fqs " $mountpoint " /proc/mounts; then
         mounted=1
     fi
 
@@ -189,8 +193,12 @@ Q_EOF
         fi
     fi
 
+    # Clean any accidental tabs/newlines in text fields
+    clean_label=$(printf '%s' "$label" | tr '\t\r\n' ' ')
+    clean_account=$(printf '%s' "$account" | tr '\t\r\n' ' ')
+
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$unit" "$encoded" "$mountpoint" "$label" "$account" \
+        "$unit" "$encoded" "$mountpoint" "$clean_label" "$clean_account" \
         "$active" "$sub_state" "$enabled" "$mounted" "$cache_bytes" \
         "$activity" "$total_bytes" "$free_bytes" "$account_type" "$cached_files_count"
 }
@@ -206,16 +214,17 @@ if [ -d "$home_dir/.config/systemd/user/default.target.wants" ]; then
         | sed -n 's/.*onedriver@\(.*\)\.service$/\1/p')
 fi
 
-cache_units=""
-if [ -d "$cache_dir" ]; then
-    for d in "$cache_dir"/*; do
-        if [ -d "$d" ] && [ -f "$d/auth_tokens.json" ]; then
-            cache_units="${cache_units}$(basename "$d")\n"
-        fi
-    done
-fi
-
-printf '%s\n%s\n%b\n' "$loaded_units" "$wants_units" "$cache_units" \
-    | sed '/^[[:space:]]*$/d' \
-    | sort -u \
-    | while IFS= read -r encoded; do emit_mount "$encoded"; done
+# Stream discovery cleanly without printf %b to preserve systemd \x2d escape sequences
+{
+    [ -n "$loaded_units" ] && printf '%s\n' "$loaded_units"
+    [ -n "$wants_units" ] && printf '%s\n' "$wants_units"
+    if [ -d "$cache_dir" ]; then
+        for d in "$cache_dir"/*; do
+            if [ -d "$d" ] && [ -f "$d/auth_tokens.json" ]; then
+                basename "$d"
+            fi
+        done
+    fi
+} | sed '/^[[:space:]]*$/d' \
+  | sort -u \
+  | while IFS= read -r encoded; do emit_mount "$encoded"; done

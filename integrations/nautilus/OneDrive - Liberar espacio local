@@ -19,6 +19,31 @@ cache_base = os.path.expanduser("~/.cache/onedriver")
 if not os.path.isdir(cache_base):
     sys.exit(0)
 
+import mmap
+import re
+
+def _unescape_systemd(encoded: str) -> str:
+    result = []
+    i = 0
+    n = len(encoded)
+    while i < n:
+        if encoded[i:i+4].startswith(r"\x"):
+            try:
+                result.append(chr(int(encoded[i+2:i+4], 16)))
+                i += 4
+                continue
+            except Exception:
+                pass
+        if encoded[i] == "-":
+            result.append("/")
+        else:
+            result.append(encoded[i])
+        i += 1
+    path = "".join(result)
+    if not path.startswith("/"):
+        path = "/" + path
+    return path
+
 # Discovered mounts
 mounts = {}
 for name in os.listdir(cache_base):
@@ -28,7 +53,7 @@ for name in os.listdir(cache_base):
     token = os.path.join(cp, "auth_tokens.json")
     if os.path.isdir(cp) and os.path.isfile(token):
         try:
-            mp = subprocess.check_output(["systemd-escape", "--unescape", "--path", name], text=True).strip()
+            mp = _unescape_systemd(name)
             if os.path.isdir(mp):
                 mounts[mp] = {
                     "cache_dir": cp,
@@ -38,7 +63,7 @@ for name in os.listdir(cache_base):
         except Exception:
             pass
 
-import re
+pattern = re.compile(rb'\{"id":"([A-Za-z0-9!_-]+)","name":"([^"]+)".*?"parentReference":\{.*?"path":"([^"]*)"', re.DOTALL)
 freed_count = 0
 
 for target in selected_paths:
@@ -46,13 +71,13 @@ for target in selected_paths:
     if not target:
         continue
 
-    # Find matching mount
+    # Find matching mount (longest mountpoint first)
     matched_mp = None
     matched_info = None
-    for mp, info in mounts.items():
+    for mp in sorted(mounts.keys(), key=len, reverse=True):
         if target == mp or target.startswith(mp + "/"):
             matched_mp = mp
-            matched_info = info
+            matched_info = mounts[mp]
             break
 
     if not matched_mp:
@@ -69,10 +94,8 @@ for target in selected_paths:
 
     try:
         with open(db_path, "rb") as f:
-            raw = f.read()
-
-        pattern = re.compile(rb'\{"id":"([A-Za-z0-9!_-]+)","name":"([^"]+)".*?"parentReference":\{.*?"path":"([^"]*)"', re.DOTALL)
-        matches = pattern.findall(raw)
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                matches = pattern.findall(mm)
 
         is_dir = os.path.isdir(target)
         target_prefix = rel_path + "/"
