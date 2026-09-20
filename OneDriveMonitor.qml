@@ -591,7 +591,12 @@ PluginComponent {
             return root.summary;
         }
 
-        function toggle(encoded: string = ""): string {
+        function toggle(): string {
+            root.togglePrimaryMount();
+            return root.summary;
+        }
+
+        function toggleAccount(encoded: string): string {
             if (encoded) {
                 const m = root.mounts.find(item => item.encoded === encoded);
                 if (m) {
@@ -599,17 +604,25 @@ PluginComponent {
                     return "toggled " + (m.label || m.encoded);
                 }
             }
-            root.togglePrimaryMount();
-            return root.summary;
+            return "account not found";
         }
 
-        function restart(encoded: string = ""): string {
-            const m = encoded ? root.mounts.find(item => item.encoded === encoded) : (root.mounts.length > 0 ? root.mounts[0] : null);
+        function restart(): string {
+            const m = root.mounts.length > 0 ? root.mounts[0] : null;
             if (m) {
                 root.runAction(m, "restart");
                 return "restarting " + (m.label || m.encoded);
             }
             return "no mount found";
+        }
+
+        function restartAccount(encoded: string): string {
+            const m = encoded ? root.mounts.find(item => item.encoded === encoded) : null;
+            if (m) {
+                root.runAction(m, "restart");
+                return "restarting " + (m.label || m.encoded);
+            }
+            return "account not found";
         }
 
         function mountAll(): string {

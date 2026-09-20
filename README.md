@@ -17,6 +17,9 @@ A native, lightweight monitor and manager for Microsoft OneDrive mounts on Linux
     - `onedrive-custom-synced`: Archivos/carpetas descargados en local.
     - `onedrive-custom-cloud`: Archivos/carpetas disponibles sólo en la nube.
     - `onedrive-custom-syncing`: Archivos/carpetas en proceso de descarga o sincronización activa.
+  - La extensión solo marca un archivo como descargado cuando la base de datos de onedriver
+    está lista y su ID coincide con un archivo real de la caché; durante la carga inicial el
+    estado queda sin clasificar para evitar falsos positivos al entrar por primera vez en una carpeta.
   - Menú contextual inteligente en Nautilus:
     - "OneDrive: Liberar espacio local" para archivos/carpetas ya sincronizados.
     - "OneDrive: Descargar en este equipo" para archivos/carpetas en la nube (soporte para carpetas con estado mixto).
@@ -49,8 +52,10 @@ A native, lightweight monitor and manager for Microsoft OneDrive mounts on Linux
   - `status`: Estado JSON del plugin y montajes.
   - `popout`: Abre el menú desplegable del widget.
   - `refresh`: Fuerza la actualización inmediata del estado.
-  - `toggle`: Conmuta el estado de la cuenta principal o de todas.
+  - `toggle`: Conmuta el estado de la cuenta principal.
+  - `toggleAccount <encoded>`: Conmuta una cuenta concreta.
   - `restart`: Reinicia el servicio de la cuenta principal.
+  - `restartAccount <encoded>`: Reinicia una cuenta concreta.
   - `mountAll`: Monta todas las cuentas configuradas.
   - `unmountAll`: Desmonta todas las cuentas activas.
   - `launcher`: Lanza `onedriver-launcher` con variables de entorno para Wayland.
@@ -69,5 +74,5 @@ dms restart
 ```
 O recarga en caliente de plugins:
 ```bash
-dms ipc plugins reload onedriverMonitor
+dms ipc call plugins reload onedriverMonitor
 ```

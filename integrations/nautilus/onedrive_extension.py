@@ -46,7 +46,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
             except Exception:
                 pass
 
-        self.mounts = {} # mountpoint -> {"cache_dir": ..., "db_path": ..., "content_dir": ..., "mtime": 0, "path_to_id": {}, "id_to_path": {}, "io_lock": ...}
+        self.mounts = {} # mountpoint -> {"cache_dir": ..., "db_path": ..., "content_dir": ..., "mtime": 0, "db_ready": False, "path_to_id": {}, "id_to_path": {}, "io_lock": ...}
         self.last_mount_check = 0
         self.cached_ids = {} # mountpoint -> (set_of_ids, timestamp)
         self.syncing_paths = set()
@@ -106,7 +106,10 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                         "io_lock": prev.get("io_lock") or threading.Lock(),
                         "db_lock": prev.get("db_lock") or threading.Lock(),
                         "db_gen": prev.get("db_gen", 0),
-                        "loading_db": prev.get("loading_db", False)
+                        "loading_db": prev.get("loading_db", False),
+                        "db_ready": prev.get("db_ready", False),
+                        "cached_folders": prev.get("cached_folders", set()),
+                        "cloud_folders": prev.get("cloud_folders", set())
                     }
         self.mounts = active_mounts
         # Prune cached_ids for any mount that was removed
@@ -117,6 +120,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
         if not os.path.isfile(db_path) or os.path.getsize(db_path) == 0:
             with mount_info["db_lock"]:
                 mount_info["loading_db"] = False
+                mount_info["db_ready"] = False
             return
         try:
             with open(db_path, "rb") as f:
@@ -143,6 +147,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                 mount_info["mtime"] = mtime
                 mount_info["path_to_id"] = path_to_id
                 mount_info["id_to_path"] = id_to_path
+                mount_info["db_ready"] = True
                 cache_dir = mount_info.get("cache_dir")
                 if cache_dir:
                     self.cached_ids.pop(cache_dir, None)
@@ -160,21 +165,28 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
         except Exception:
             with mount_info["db_lock"]:
                 mount_info["loading_db"] = False
+                mount_info["db_ready"] = False
 
     def _load_db_if_needed(self, mount_info: dict, files_to_invalidate=None):
         db_path = mount_info["db_path"]
         if not os.path.isfile(db_path) or os.path.getsize(db_path) == 0:
+            with mount_info["db_lock"]:
+                mount_info["db_ready"] = False
             return
 
         try:
             mtime = os.path.getmtime(db_path)
-            if mtime <= mount_info.get("mtime", 0) and mount_info.get("path_to_id"):
+            if mtime <= mount_info.get("mtime", 0) and mount_info.get("db_ready", False):
                 return
 
             with mount_info["db_lock"]:
                 if mount_info.get("loading_db"):
                     return
                 mount_info["loading_db"] = True
+                # Do not expose the previous snapshot while the database is
+                # being re-read. A stale mapping can make a cloud-only file
+                # look local during the refresh window.
+                mount_info["db_ready"] = False
                 mount_info["db_gen"] = mount_info.get("db_gen", 0) + 1
                 gen = mount_info["db_gen"]
 
@@ -187,13 +199,31 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
         content_dir = mount_info["content_dir"]
         mp = mount_info["cache_dir"]
         now = time.time()
+
+        # The cache directory can contain stale/orphaned entries while the
+        # database is being updated. Until the database snapshot is ready,
+        # there is not enough information to identify a local cloud item.
+        # Treating it as unknown is safer than showing a false "downloaded"
+        # emblem on first folder access.
+        if not mount_info.get("db_ready", False):
+            self.cached_ids.pop(mp, None)
+            mount_info["cached_folders"] = set()
+            mount_info["cloud_folders"] = set()
+            return set()
+
         cached, ts = self.cached_ids.get(mp, (set(), 0))
         if now - ts < 1.5:
             return cached
 
         if os.path.isdir(content_dir):
             try:
-                cached = set(os.listdir(content_dir))
+                known_ids = set(mount_info.get("id_to_path", {}))
+                cached = {
+                    entry
+                    for entry in os.listdir(content_dir)
+                    if entry in known_ids
+                    and os.path.isfile(os.path.join(content_dir, entry))
+                }
             except Exception:
                 cached = set()
         else:
@@ -255,6 +285,12 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
             is_syncing = any(file_path == p or file_path.startswith(p + "/") or (file.is_directory() and p.startswith(file_path + "/")) for p in syncing_snapshot)
             if is_syncing:
                 file.add_emblem("onedrive-custom-syncing")
+                return Nautilus.OperationResult.COMPLETE
+
+            # While the async database snapshot is not ready, leave the
+            # extension neutral. In particular, do not classify a first-view
+            # file as downloaded from an unvalidated cache entry.
+            if not mount_info.get("db_ready", False):
                 return Nautilus.OperationResult.COMPLETE
 
             if file.is_directory():
