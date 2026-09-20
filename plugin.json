@@ -8,9 +8,9 @@
   "capabilities": ["dankbar-widget", "control-center", "monitoring", "filesystem"],
   "component": "./OneDriveMonitor.qml",
   "settings": "./Settings.qml",
-  "startupCheck": "./StartupCheck.qml",
   "icon": "cloud_sync",
   "requires_dms": ">=1.6.0",
+  "requires": ["onedriver"],
   "dependencies": ["onedriver", "systemctl", "journalctl", "findmnt", "xdg-open", "timeout"],
   "permissions": ["settings_read", "settings_write", "process"]
 }

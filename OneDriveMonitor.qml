@@ -38,9 +38,14 @@ PluginComponent {
     readonly property bool notifyStateChanges: !pluginData || pluginData.notifyStateChanges === undefined || pluginData.notifyStateChanges === true || pluginData.notifyStateChanges === "true"
     readonly property bool showBarText: !pluginData || pluginData.showBarText === undefined || pluginData.showBarText === true || pluginData.showBarText === "true"
     readonly property bool enableNautilus: !pluginData || pluginData.enableNautilus === undefined || pluginData.enableNautilus === true || pluginData.enableNautilus === "true"
+    property bool _nautilusInitDone: false
 
     onEnableNautilusChanged: {
         if (!actionsPath) return;
+        if (!_nautilusInitDone) {
+            _nautilusInitDone = true;
+            return;
+        }
         if (enableNautilus) {
             Quickshell.execDetached(["sh", actionsPath, "install-nautilus", "--restart"]);
         } else {
@@ -128,7 +133,7 @@ PluginComponent {
 
     readonly property string barText: {
         if (mounts.length === 0)
-            return "—";
+            return "";
         if (mounts.length === 1)
             return (mounts[0].active === "active" && mounts[0].mounted === "1") ? "Activo" : "Detenido";
         return activeCount + "/" + mounts.length;
@@ -157,7 +162,7 @@ PluginComponent {
     }
 
     function activityIcon(mount) {
-        if (isMountDegraded(mount)) return "cloud_alert";
+        if (isMountDegraded(mount)) return "sync_problem";
         switch (activityKind(mount)) {
         case "upload": return "cloud_upload";
         case "download": return "cloud_download";
@@ -657,7 +662,7 @@ PluginComponent {
     }
 
     ccWidgetIcon: {
-        if (root.hasProblem) return "cloud_alert";
+        if (root.hasProblem) return "sync_problem";
         if (root.transferCount > 0) return "cloud_sync";
         if (root.activeCount > 0) return "cloud_done";
         return "cloud_off";
@@ -673,85 +678,64 @@ PluginComponent {
     pillRightClickAction: () => root.openSettings()
 
     horizontalBarPill: Component {
-        Item {
-            implicitWidth: barContent.implicitWidth
-            implicitHeight: root.widgetThickness
-            width: implicitWidth
-            height: implicitHeight
+        Row {
+            spacing: (root.showBarText && !!root.barText) ? Theme.spacingXS : 0
 
-            Row {
-                id: barContent
-                anchors.centerIn: parent
-                spacing: (root.showBarText && !!root.barText) ? Theme.spacingXS : 0
-
-                DankIcon {
-                    name: {
-                        if (root.hasProblem) return "cloud_alert";
-                        if (root.transferCount > 0) return "cloud_sync";
-                        if (root.activeCount > 0) return "cloud_done";
-                        return "cloud_off";
-                    }
-                    size: Theme.iconSizeSmall
-                    color: {
-                        if (root.hasProblem) return Theme.warning;
-                        if (root.transferCount > 0) return Theme.primary;
-                        if (root.activeCount > 0) return Theme.widgetIconColor;
-                        return Theme.surfaceVariantText;
-                    }
-                    anchors.verticalCenter: parent.verticalCenter
+            DankIcon {
+                name: {
+                    if (root.hasProblem) return "sync_problem";
+                    if (root.transferCount > 0) return "cloud_sync";
+                    if (root.activeCount > 0) return "cloud_done";
+                    return "cloud_off";
                 }
-
-                StyledText {
-                    visible: root.showBarText && !!root.barText
-                    width: (root.showBarText && !!root.barText) ? implicitWidth : 0
-                    text: root.barText
-                    color: Theme.surfaceText
-                    font.pixelSize: Theme.fontSizeSmall
-                    anchors.verticalCenter: parent.verticalCenter
+                size: root.iconSize
+                color: {
+                    if (root.hasProblem) return Theme.warning;
+                    if (root.transferCount > 0) return Theme.primary;
+                    if (root.activeCount > 0) return Theme.widgetIconColor;
+                    return Theme.surfaceVariantText;
                 }
+                anchors.verticalCenter: parent.verticalCenter
+            }
+
+            StyledText {
+                visible: root.showBarText && !!root.barText
+                text: root.barText
+                color: Theme.surfaceText
+                font.pixelSize: Theme.fontSizeSmall
+                anchors.verticalCenter: parent.verticalCenter
             }
         }
     }
 
     verticalBarPill: Component {
-        Item {
-            implicitWidth: root.widgetThickness
-            implicitHeight: barContent.implicitHeight
-            width: implicitWidth
-            height: implicitHeight
+        Column {
+            spacing: (root.showBarText && !!root.barText) ? Theme.spacingXS : 0
 
-            Column {
-                id: barContent
-                anchors.centerIn: parent
-                spacing: (root.showBarText && !!root.barText) ? Theme.spacingXS : 0
-
-                DankIcon {
-                    name: {
-                        if (root.hasProblem) return "cloud_alert";
-                        if (root.transferCount > 0) return "cloud_sync";
-                        if (root.activeCount > 0) return "cloud_done";
-                        return "cloud_off";
-                    }
-                    size: Theme.iconSizeSmall
-                    color: {
-                        if (root.hasProblem) return Theme.warning;
-                        if (root.transferCount > 0) return Theme.primary;
-                        if (root.activeCount > 0) return Theme.widgetIconColor;
-                        return Theme.surfaceVariantText;
-                    }
-                    anchors.horizontalCenter: parent.horizontalCenter
+            DankIcon {
+                name: {
+                    if (root.hasProblem) return "sync_problem";
+                    if (root.transferCount > 0) return "cloud_sync";
+                    if (root.activeCount > 0) return "cloud_done";
+                    return "cloud_off";
                 }
-
-                StyledText {
-                    visible: root.showBarText && !!root.barText
-                    width: (root.showBarText && !!root.barText) ? implicitWidth : 0
-                    height: (root.showBarText && !!root.barText) ? implicitHeight : 0
-                    text: root.barText
-                    color: Theme.surfaceText
-                    font.pixelSize: Theme.fontSizeSmall
-                    rotation: 90
-                    anchors.horizontalCenter: parent.horizontalCenter
+                size: root.iconSize
+                color: {
+                    if (root.hasProblem) return Theme.warning;
+                    if (root.transferCount > 0) return Theme.primary;
+                    if (root.activeCount > 0) return Theme.widgetIconColor;
+                    return Theme.surfaceVariantText;
                 }
+                anchors.horizontalCenter: parent.horizontalCenter
+            }
+
+            StyledText {
+                visible: root.showBarText && !!root.barText
+                text: root.barText
+                color: Theme.surfaceText
+                font.pixelSize: Theme.fontSizeSmall
+                rotation: 90
+                anchors.horizontalCenter: parent.horizontalCenter
             }
         }
     }

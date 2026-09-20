@@ -311,8 +311,9 @@ case "$cmd" in
         # Reset all cached files so monitor immediately recalculates
         rm -f "$runtime_dir"/*_"${encoded}.tmp" /tmp/onedriver_*_"${encoded}.tmp" 2>/dev/null || true
         if [ "$was_active" -eq 1 ]; then
-            if ! systemctl --user start "$unit" 2>/dev/null; then
-                echo "Advertencia: no se pudo reiniciar $unit tras vaciar la caché" >&2
+            systemctl --user reset-failed "$unit" 2>/dev/null || true
+            if ! out=$(systemctl --user start "$unit" 2>&1); then
+                echo "Advertencia: no se pudo reiniciar $unit tras vaciar la caché: $out" >&2
                 exit 1
             fi
         fi
@@ -341,6 +342,7 @@ case "$cmd" in
         if ! systemctl --user disable "$unit" 2>/dev/null; then
             echo "Advertencia: no se pudo deshabilitar inicio automático de $unit" >&2
         fi
+        rm -f "${XDG_CONFIG_HOME:-$home_dir/.config}/systemd/user/default.target.wants/$unit" 2>/dev/null || true
         systemctl --user reset-failed "$unit" 2>/dev/null || true
         systemctl --user daemon-reload 2>/dev/null || true
         rm -rf "$cache_dir/$encoded" 2>/dev/null || true

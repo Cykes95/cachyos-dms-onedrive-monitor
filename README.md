@@ -34,11 +34,11 @@ A native, lightweight monitor and manager for Microsoft OneDrive mounts on Linux
   - Prevención de interbloqueos (*deadlocks*) con adquisición ordenada de bloqueos concurrentes por punto de montaje.
 
 - **Integración con DankMaterialShell**:
-  - Pastilla para barra superior en orientaciones horizontal y vertical con icono dinámico según el estado global (`cloud_done`, `cloud_sync`, `cloud_alert`, `cloud_off`).
+  - Pastilla para barra superior en orientaciones horizontal y vertical con icono dinámico según el estado global (`cloud_done`, `cloud_sync`, `sync_problem`, `cloud_off`).
   - Mosaico en el Centro de Control (`ccWidget`) para alternar estado con un toque e icono reactivo.
   - Notificaciones nativas mediante `ToastService` ante desconexiones, errores o reconexiones.
   - Historial de actividad de subida, descarga y finalización de transferencias de la sesión.
-  - Comprobación avanzada de dependencias del sistema (`StartupCheck.qml`).
+  - Carga síncrona optimizada al iniciar la shell sin bloqueos ni retrasos.
   - Diagnóstico completo copiable al portapapeles con un clic.
 
 - **Ajustes Modernos (`Settings.qml`)**:
