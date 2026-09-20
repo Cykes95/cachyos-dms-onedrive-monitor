@@ -11,9 +11,18 @@ import re
 import time
 import urllib.parse
 import threading
+import subprocess
 import gi
 gi.require_version('Nautilus', '4.1')
 from gi.repository import Nautilus, GObject, Gio, GLib
+
+DB_PATTERN = re.compile(rb'\{"id":"([A-Za-z0-9!_-]+)","name":"([^"]+)".*?"parentReference":\{.*?"path":"([^"]*)"', re.DOTALL)
+
+def _notify(title: str, message: str, icon: str = "onedrive-custom-cloud"):
+    try:
+        subprocess.Popen(["notify-send", "-a", "OneDrive", "-i", icon, title, message])
+    except Exception:
+        pass
 
 class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuProvider):
     def __init__(self):
@@ -22,6 +31,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
         self.mounts = {} # mountpoint -> {"cache_dir": ..., "db_path": ..., "content_dir": ..., "mtime": 0, "path_to_id": {}, "id_to_path": {}}
         self.last_mount_check = 0
         self.cached_ids = {} # mountpoint -> (set_of_ids, timestamp)
+        self.syncing_paths = set()
         self._refresh_mounts()
 
     def _unescape_systemd(self, encoded: str) -> str:
@@ -91,8 +101,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
             with open(db_path, "rb") as f:
                 raw = f.read()
 
-            pattern = re.compile(rb'\{"id":"([A-Za-z0-9!_-]+)","name":"([^"]+)".*?"parentReference":\{.*?"path":"([^"]*)"', re.DOTALL)
-            matches = pattern.findall(raw)
+            matches = DB_PATTERN.findall(raw)
 
             path_to_id = {}
             id_to_path = {}
@@ -178,6 +187,10 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
             rel_path = os.path.relpath(file_path, mp)
             path_to_id = mount_info.get("path_to_id", {})
             item_id = path_to_id.get(rel_path)
+
+            if file_path in self.syncing_paths or (file.is_directory() and any(p.startswith(file_path + "/") for p in self.syncing_paths)):
+                file.add_emblem("onedrive-custom-syncing")
+                return Nautilus.OperationResult.COMPLETE
 
             if file.is_directory():
                 has_cached = rel_path in mount_info.get("cached_folders", set())
@@ -270,11 +283,15 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
 
     def _on_free_space_activate(self, menu_item, onedrive_files):
         def worker():
+            freed = 0
+            affected_mounts = set()
             for file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded in onedrive_files:
                 content_dir = mount_info.get("content_dir")
                 path_to_id = mount_info.get("path_to_id", {})
                 if not content_dir or not os.path.isdir(content_dir):
                     continue
+
+                affected_mounts.add(mount_info.get("cache_dir"))
 
                 if is_dir:
                     prefix = rel_path + "/"
@@ -284,6 +301,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                             if os.path.isfile(cf):
                                 try:
                                     os.remove(cf)
+                                    freed += 1
                                 except Exception:
                                     pass
                 else:
@@ -292,39 +310,76 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                         if os.path.isfile(cf):
                             try:
                                 os.remove(cf)
+                                freed += 1
                             except Exception:
                                 pass
 
+            # Clear cached IDs so next info update re-reads fresh directory state
+            for cd in affected_mounts:
+                if cd:
+                    self.cached_ids.pop(cd, None)
+
+            for file, _, _, _, _, _, _, _ in onedrive_files:
                 try:
                     GLib.idle_add(file.invalidate_extension_info)
                 except Exception:
                     pass
+
+            if freed > 0:
+                _notify("OneDrive: Espacio liberado", f"Se desalojaron {freed} archivo(s) del equipo sin eliminarlos de la nube.", "onedrive-custom-cloud")
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_download_activate(self, menu_item, onedrive_files):
+        # 1. Immediately mark target files as syncing and trigger emblem update
+        for file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded in onedrive_files:
+            self.syncing_paths.add(file_path)
+            try:
+                file.invalidate_extension_info()
+            except Exception:
+                pass
+
         def worker():
-            for file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded in onedrive_files:
-                if is_dir:
-                    # Walk directory and touch files to download
-                    for root_dir, _, filenames in os.walk(file_path):
-                        for fn in filenames:
-                            fp = os.path.join(root_dir, fn)
-                            try:
-                                with open(fp, "rb") as f:
-                                    f.read(1)
-                            except Exception:
-                                pass
-                else:
+            downloaded = 0
+            affected_mounts = set()
+            try:
+                for file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded in onedrive_files:
+                    affected_mounts.add(mount_info.get("cache_dir"))
+                    if is_dir:
+                        for root_dir, _, filenames in os.walk(file_path):
+                            for fn in filenames:
+                                fp = os.path.join(root_dir, fn)
+                                try:
+                                    with open(fp, "rb") as f:
+                                        while f.read(1024 * 1024):
+                                            pass
+                                    downloaded += 1
+                                except Exception:
+                                    pass
+                    else:
+                        try:
+                            with open(file_path, "rb") as f:
+                                while f.read(1024 * 1024):
+                                    pass
+                            downloaded += 1
+                        except Exception:
+                            pass
+            finally:
+                # 2. Clear syncing state and invalidate cache
+                for file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded in onedrive_files:
+                    self.syncing_paths.discard(file_path)
+
+                for cd in affected_mounts:
+                    if cd:
+                        self.cached_ids.pop(cd, None)
+
+                for file, _, _, _, _, _, _, _ in onedrive_files:
                     try:
-                        with open(file_path, "rb") as f:
-                            f.read(1)
+                        GLib.idle_add(file.invalidate_extension_info)
                     except Exception:
                         pass
 
-                try:
-                    GLib.idle_add(file.invalidate_extension_info)
-                except Exception:
-                    pass
+                if downloaded > 0:
+                    _notify("OneDrive: Descarga completada", f"Se descargaron {downloaded} archivo(s) para uso sin conexión.", "onedrive-custom-synced")
 
         threading.Thread(target=worker, daemon=True).start()

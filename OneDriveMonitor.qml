@@ -31,6 +31,7 @@ PluginComponent {
     readonly property bool showCache: !pluginData || pluginData.showCache === undefined || pluginData.showCache === true || pluginData.showCache === "true"
     readonly property bool showInactive: !pluginData || pluginData.showInactive === undefined || pluginData.showInactive === true || pluginData.showInactive === "true"
     readonly property bool notifyStateChanges: !pluginData || pluginData.notifyStateChanges === undefined || pluginData.notifyStateChanges === true || pluginData.notifyStateChanges === "true"
+    readonly property bool showBarText: !pluginData || pluginData.showBarText === undefined || pluginData.showBarText === true || pluginData.showBarText === "true"
     readonly property bool enableNautilus: !pluginData || pluginData.enableNautilus === undefined || pluginData.enableNautilus === true || pluginData.enableNautilus === "true"
 
     onEnableNautilusChanged: {
@@ -433,7 +434,7 @@ PluginComponent {
                     ToastService.showInfo("OneDrive", "Inicio automático actualizado");
                     break;
                 case "clear-cache":
-                    ToastService.showInfo("OneDrive", "Caché local vaciada con éxito");
+                    ToastService.showInfo("OneDrive", "Caché local vaciada con éxito (archivos en la nube intactos)");
                     break;
                 case "remove-mount":
                     ToastService.showInfo("OneDrive", "Cuenta desvinculada del sistema");
@@ -531,13 +532,24 @@ PluginComponent {
                 spacing: Theme.spacingXS
 
                 DankIcon {
-                    name: root.transferCount > 0 ? "cloud_sync" : "cloud"
+                    name: {
+                        if (root.hasProblem) return "cloud_alert";
+                        if (root.transferCount > 0) return "cloud_sync";
+                        if (root.activeCount > 0) return "cloud_done";
+                        return "cloud_off";
+                    }
                     size: Theme.iconSizeSmall
-                    color: root.hasProblem ? Theme.warning : Theme.widgetIconColor
+                    color: {
+                        if (root.hasProblem) return Theme.warning;
+                        if (root.transferCount > 0) return Theme.primary;
+                        if (root.activeCount > 0) return Theme.widgetIconColor;
+                        return Theme.surfaceVariantText;
+                    }
                     anchors.verticalCenter: parent.verticalCenter
                 }
 
                 StyledText {
+                    visible: root.showBarText && !!root.barText
                     text: root.barText
                     color: Theme.surfaceText
                     font.pixelSize: Theme.fontSizeSmall
@@ -560,13 +572,24 @@ PluginComponent {
                 spacing: Theme.spacingXS
 
                 DankIcon {
-                    name: root.transferCount > 0 ? "cloud_sync" : "cloud"
+                    name: {
+                        if (root.hasProblem) return "cloud_alert";
+                        if (root.transferCount > 0) return "cloud_sync";
+                        if (root.activeCount > 0) return "cloud_done";
+                        return "cloud_off";
+                    }
                     size: Theme.iconSizeSmall
-                    color: root.hasProblem ? Theme.warning : Theme.widgetIconColor
+                    color: {
+                        if (root.hasProblem) return Theme.warning;
+                        if (root.transferCount > 0) return Theme.primary;
+                        if (root.activeCount > 0) return Theme.widgetIconColor;
+                        return Theme.surfaceVariantText;
+                    }
                     anchors.horizontalCenter: parent.horizontalCenter
                 }
 
                 StyledText {
+                    visible: root.showBarText && !!root.barText
                     text: root.barText
                     color: Theme.surfaceText
                     font.pixelSize: Theme.fontSizeSmall

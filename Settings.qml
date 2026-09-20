@@ -39,6 +39,13 @@ PluginSettings {
             description: "Muestra las cuentas configuradas en la lista aunque estén desmontadas actualmente"
             defaultValue: true
         }
+
+        ToggleSetting {
+            settingKey: "showBarText"
+            label: "Mostrar texto en la barra superior"
+            description: "Muestra el estado ('Activo', '1/1') junto al icono de la nube en el panel superior"
+            defaultValue: true
+        }
     }
 
     SettingsCard {

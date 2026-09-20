@@ -181,6 +181,14 @@ case "$cmd" in
             gtk-update-icon-cache -f -t "$icons_dir" 2>/dev/null || true
         fi
 
+        # Ensure systemd user drop-in exists so onedriver unmount quirks never show as failures
+        systemd_override_dir="$home_dir/.config/systemd/user/onedriver@.service.d"
+        mkdir -p "$systemd_override_dir" 2>/dev/null || true
+        if [ ! -f "$systemd_override_dir/override.conf" ]; then
+            printf '[Service]\nExecStopPost=\nExecStopPost=-/usr/bin/fusermount3 -uz /%%I\n' > "$systemd_override_dir/override.conf" 2>/dev/null || true
+            systemctl --user daemon-reload 2>/dev/null || true
+        fi
+
         case "$1" in
             --restart|-r)
                 if pgrep -x nautilus >/dev/null 2>&1; then

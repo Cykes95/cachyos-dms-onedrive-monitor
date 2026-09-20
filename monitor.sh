@@ -38,8 +38,28 @@ emit_mount() {
     token_file="$cache_entry/auth_tokens.json"
     label_file="$mountpoint/.xdg-volume-info"
 
-    label=$(sed -n 's/^Name=//p' "$label_file" 2>/dev/null | head -n 1)
-    account=$(sed -n 's/.*"account":"\([^"]*\)".*/\1/p' "$token_file" 2>/dev/null | head -n 1)
+    label=""
+    if [ -r "$label_file" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+                Name=*) label="${line#Name=}"; break ;;
+            esac
+        done < "$label_file"
+    fi
+
+    account=""
+    if [ -r "$token_file" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+                *\"account\":*)
+                    account=${line#*\"account\":\"}
+                    account=${account%%\"*}
+                    break
+                    ;;
+            esac
+        done < "$token_file"
+    fi
+
     [ -n "$label" ] || label="$account"
     [ -n "$label" ] || label="$mountpoint"
 
@@ -69,11 +89,10 @@ emit_mount() {
 $(systemctl --user show "$unit" --property=ActiveState,SubState,UnitFileState 2>/dev/null)
 PROP_EOF
 
-    filesystem=$(findmnt -M "$mountpoint" --noheadings --output FSTYPE 2>/dev/null || true)
     mounted=0
-    case "$filesystem" in
-        fuse*|onedriver) mounted=1 ;;
-    esac
+    if [ -r /proc/mounts ] && grep -Fqs " $mountpoint " /proc/mounts; then
+        mounted=1
+    fi
 
     # Optimization: Cache size lookup with 30-second TTL
     cache_bytes=0
