@@ -43,6 +43,8 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
         self._sync_lock = threading.Lock()
         self._active_files_lock = threading.Lock()
         self._active_files = {}  # file_path -> Nautilus.FileInfo
+        self._pending_updates_lock = threading.Lock()
+        self._pending_updates = {}  # handle -> (closure, provider, handle, file, file_path, mp, mount_info)
         self.cache_base = onedrive_core.get_cache_base()
         self.mounts = {}
         self.last_mount_check = 0
@@ -212,6 +214,16 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
             if not need_db_reload and not need_content_refresh:
                 return
 
+            if mount_info["loading_db"]:
+                mount_info["content_dirty"] = True
+                # Only register interested FileInfo when a load is actively occurring
+                if file_or_files:
+                    if isinstance(file_or_files, (list, set, tuple)):
+                        mount_info["pending_invalidation"].update(f for f in file_or_files if isinstance(f, Nautilus.FileInfo))
+                    elif isinstance(file_or_files, Nautilus.FileInfo):
+                        mount_info["pending_invalidation"].add(file_or_files)
+                return
+
             # Synchronous fast-path on initial load:
             # Read metadata only (content_dir=None, NO hash computation, no freeze)
             # so the very first Nautilus render receives emblems immediately!
@@ -229,16 +241,6 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                         need_content_refresh = True
                 except Exception:
                     pass
-
-            if mount_info["loading_db"]:
-                mount_info["content_dirty"] = True
-                # Only register interested FileInfo when a load is actively occurring
-                if file_or_files:
-                    if isinstance(file_or_files, (list, set, tuple)):
-                        mount_info["pending_invalidation"].update(f for f in file_or_files if isinstance(f, Nautilus.FileInfo))
-                    elif isinstance(file_or_files, Nautilus.FileInfo):
-                        mount_info["pending_invalidation"].add(file_or_files)
-                return
 
             mount_info["loading_db"] = True
             mount_info["content_dirty"] = False
@@ -298,20 +300,49 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                         mount_info["last_error_time"] = time.time()
                         mount_info["loading_db"] = False
                         mount_info["pending_invalidation"].clear()
-                        return False
+                    else:
+                        if snapshot and snapshot.get("read_success"):
+                            mount_info["snapshot"] = snapshot
+                            mount_info["mtime"] = db_mtime
+                            mount_info["content_mtime"] = content_mtime
+                            mount_info["txid"] = snapshot.get("txid", 0)
+                            mount_info["db_ready"] = True
+                            mount_info["last_error_time"] = 0
 
-                    if snapshot and snapshot.get("read_success"):
-                        mount_info["snapshot"] = snapshot
-                        mount_info["mtime"] = db_mtime
-                        mount_info["content_mtime"] = content_mtime
-                        mount_info["txid"] = snapshot.get("txid", 0)
-                        mount_info["db_ready"] = True
-                        mount_info["last_error_time"] = 0
+                        mount_info["loading_db"] = False
 
-                    mount_info["loading_db"] = False
                     to_invalidate = list(mount_info["pending_invalidation"])
                     mount_info["pending_invalidation"].clear()
 
+                # 1. Complete any pending asynchronous requests for this mount
+                with self._pending_updates_lock:
+                    pending_handles = [
+                        h for h, item in self._pending_updates.items()
+                        if item[6] is mount_info
+                    ]
+                    pending_items = [self._pending_updates.pop(h) for h in pending_handles]
+
+                for closure, prov, handle, f, fp, m_p, mi in pending_items:
+                    try:
+                        if error_occurred:
+                            Nautilus.info_provider_update_complete_invoke(
+                                closure,
+                                prov,
+                                handle,
+                                Nautilus.OperationResult.FAILED
+                            )
+                        else:
+                            self._apply_emblem_to_file(f, fp, m_p, mi)
+                            Nautilus.info_provider_update_complete_invoke(
+                                closure,
+                                prov,
+                                handle,
+                                Nautilus.OperationResult.COMPLETE
+                            )
+                    except Exception:
+                        pass
+
+                # 2. Invalidate already-rendered active files so Nautilus refreshes them
                 self._invalidate_active_files_for_mount(mount_info.get("mp", ""))
                 for f in to_invalidate:
                     try:
@@ -333,7 +364,49 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
         return None, None
 
     # --- Nautilus.InfoProvider Interface ---
-    def update_file_info(self, file: Nautilus.FileInfo) -> Nautilus.OperationResult:
+    def _apply_emblem_to_file(self, file: Nautilus.FileInfo, file_path: str, mp: str, mount_info: dict) -> bool:
+        try:
+            with self._sync_lock:
+                syncing_snapshot = set(self.syncing_paths)
+
+            is_syncing = any(
+                file_path == p or file_path.startswith(p + "/") or
+                (file.is_directory() and p.startswith(file_path + "/"))
+                for p in syncing_snapshot
+            )
+            if is_syncing:
+                file.add_emblem("onedrive-custom-syncing")
+                return True
+
+            snapshot = mount_info.get("snapshot")
+            if not mount_info.get("db_ready") or not snapshot:
+                return False
+
+            rel_path = "" if file_path == mp else os.path.relpath(file_path, mp)
+            rel_path = unicodedata.normalize("NFC", rel_path)
+
+            if file.is_directory():
+                has_cached = rel_path in snapshot.get("cached_folders", set())
+                has_cloud = rel_path in snapshot.get("cloud_folders", set())
+                is_known = rel_path in snapshot.get("known_folders", set())
+
+                if has_cached and not has_cloud:
+                    file.add_emblem("onedrive-custom-synced")
+                elif has_cloud or has_cached or is_known:
+                    file.add_emblem("onedrive-custom-cloud")
+            else:
+                item_info = snapshot.get("path_to_item", {}).get(rel_path)
+                if item_info:
+                    item_id = item_info["id"]
+                    if item_id in snapshot.get("cached_ids", set()):
+                        file.add_emblem("onedrive-custom-synced")
+                    else:
+                        file.add_emblem("onedrive-custom-cloud")
+            return True
+        except Exception:
+            return False
+
+    def update_file_info_full(self, provider, handle, closure, file: Nautilus.FileInfo) -> Nautilus.OperationResult:
         try:
             loc = file.get_location()
             if not loc:
@@ -351,43 +424,41 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
 
             self._load_db_if_needed(mount_info, file)
 
-            with self._sync_lock:
-                syncing_snapshot = set(self.syncing_paths)
-
-            is_syncing = any(
-                file_path == p or file_path.startswith(p + "/") or
-                (file.is_directory() and p.startswith(file_path + "/"))
-                for p in syncing_snapshot
-            )
-            if is_syncing:
-                file.add_emblem("onedrive-custom-syncing")
+            # If snapshot is already ready and loaded, apply immediately
+            if mount_info.get("db_ready") and mount_info.get("snapshot"):
+                self._apply_emblem_to_file(file, file_path, mp, mount_info)
                 return Nautilus.OperationResult.COMPLETE
 
-            if not mount_info.get("db_ready") or not mount_info.get("snapshot"):
+            # Snapshot still loading in background: register async handle
+            with self._pending_updates_lock:
+                self._pending_updates[handle] = (closure, provider, handle, file, file_path, mp, mount_info)
+
+            return Nautilus.OperationResult.IN_PROGRESS
+        except Exception:
+            return Nautilus.OperationResult.COMPLETE
+
+    def cancel_update(self, provider, handle):
+        with self._pending_updates_lock:
+            self._pending_updates.pop(handle, None)
+
+    def update_file_info(self, file: Nautilus.FileInfo) -> Nautilus.OperationResult:
+        try:
+            loc = file.get_location()
+            if not loc:
+                return Nautilus.OperationResult.COMPLETE
+            file_path = loc.get_path()
+            if not file_path:
                 return Nautilus.OperationResult.COMPLETE
 
-            snapshot = mount_info["snapshot"]
-            rel_path = "" if file_path == mp else os.path.relpath(file_path, mp)
-            rel_path = unicodedata.normalize("NFC", rel_path)
+            file_path = unicodedata.normalize("NFC", file_path)
+            self._register_active_file(file_path, file)
 
-            if file.is_directory():
-                has_cached = rel_path in snapshot["cached_folders"]
-                has_cloud = rel_path in snapshot["cloud_folders"]
-                is_known = rel_path in snapshot["known_folders"]
+            mp, mount_info = self._match_mount(file_path)
+            if not mp or not mount_info:
+                return Nautilus.OperationResult.COMPLETE
 
-                if has_cached and not has_cloud:
-                    file.add_emblem("onedrive-custom-synced")
-                elif has_cloud or has_cached or is_known:
-                    file.add_emblem("onedrive-custom-cloud")
-            else:
-                item_info = snapshot["path_to_item"].get(rel_path)
-                if item_info:
-                    item_id = item_info["id"]
-                    if item_id in snapshot["cached_ids"]:
-                        file.add_emblem("onedrive-custom-synced")
-                    else:
-                        file.add_emblem("onedrive-custom-cloud")
-
+            self._load_db_if_needed(mount_info, file)
+            self._apply_emblem_to_file(file, file_path, mp, mount_info)
         except Exception:
             pass
 

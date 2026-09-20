@@ -262,6 +262,68 @@ def test_extension_invalidation_and_bounded_active_files():
     print("PASS")
 
 
+def test_async_info_provider_contract():
+    print("Running test_async_info_provider_contract...", end=" ")
+    import gi
+    gi.require_version("Nautilus", "4.1")
+    from gi.repository import Nautilus, Gio
+    import onedrive_extension
+
+    ext = onedrive_extension.OneDriveExtension()
+
+    class MockFileInfo:
+        def __init__(self, path):
+            self.path = path
+            self.emblems = []
+        def get_location(self):
+            return Gio.File.new_for_path(self.path)
+        def is_directory(self):
+            return False
+        def add_emblem(self, emblem):
+            self.emblems.append(emblem)
+
+    mp = "/home/andres/OneDrive-Lab"
+    if mp not in ext.mounts:
+        # Fallback if unmounted during test
+        print("SKIP (no active mount)")
+        return
+
+    mount_info = ext.mounts[mp]
+
+    class MockHandle:
+        pass
+
+    # 1. Test IN_PROGRESS when loading in background
+    orig_snap = mount_info.get("snapshot")
+    orig_ready = mount_info.get("db_ready")
+    mount_info["db_ready"] = False
+    mount_info["snapshot"] = None
+    mount_info["loading_db"] = True
+
+    h = MockHandle()
+    f = MockFileInfo(f"{mp}/test_doc.docx")
+    res = ext.update_file_info_full(ext, h, "closure", f)
+    assert res == Nautilus.OperationResult.IN_PROGRESS, f"Expected IN_PROGRESS, got {res}"
+    assert h in ext._pending_updates
+
+    # 2. Test cancellation
+    ext.cancel_update(ext, h)
+    assert h not in ext._pending_updates
+
+    # 3. Restore and test COMPLETE when ready
+    mount_info["snapshot"] = orig_snap
+    mount_info["db_ready"] = orig_ready
+    mount_info["loading_db"] = False
+
+    if orig_snap:
+        h2 = MockHandle()
+        f2 = MockFileInfo(f"{mp}/.xdg-volume-info")
+        res2 = ext.update_file_info_full(ext, h2, "closure", f2)
+        assert res2 == Nautilus.OperationResult.COMPLETE, f"Expected COMPLETE, got {res2}"
+
+    print("PASS")
+
+
 if __name__ == "__main__":
     print("=== Running OneDriveMonitor Reliability Test Suite ===")
     test_quickxorhash_vector()
@@ -273,4 +335,5 @@ if __name__ == "__main__":
     test_clear_cache_with_dotfiles()
     test_large_cache_performance()
     test_extension_invalidation_and_bounded_active_files()
-    print("=== All 9 Reliability Tests PASSED successfully! ===")
+    test_async_info_provider_contract()
+    print("=== All 10 Reliability Tests PASSED successfully! ===")
