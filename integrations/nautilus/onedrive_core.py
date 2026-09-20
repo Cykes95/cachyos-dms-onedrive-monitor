@@ -18,6 +18,8 @@ import json
 import time
 import fcntl
 import stat
+import unicodedata
+import base64
 
 BOLT_MAGIC = 0xED0CDAED
 DEFAULT_PAGE_SIZE = 4096
@@ -139,11 +141,107 @@ def release_lock(lf):
         except Exception:
             pass
 
-def is_item_cached(content_dir: str, item_id: str, remote_size: int = 0) -> bool:
+class QuickXorHash:
     """
-    Verifies if an item is physically, regularly and completely cached on disk.
-    For any remote size (including 0), local file must be regular and have exact matching size.
-    Unknown remote size (< 0 or None) is treated as unverified (False).
+    Pure Python implementation of Microsoft's QuickXorHash algorithm.
+    WidthInBits = 160 (20 bytes), Shift = 11, DataSize = 11 * 160 = 1760 bytes.
+    Matches Microsoft OneDrive / SharePoint and onedriver checksums.
+    """
+    DATA_SIZE = 11 * 160  # 1760
+
+    def __init__(self):
+        self.data = bytearray(self.DATA_SIZE)
+        self.length = 0
+
+    def update(self, b: bytes):
+        n = len(b)
+        if n == 0:
+            return
+        last_remain = self.length % self.DATA_SIZE
+        offset = 0
+
+        if last_remain != 0:
+            chunk = min(n, self.DATA_SIZE - last_remain)
+            for j in range(chunk):
+                self.data[last_remain + j] ^= b[j]
+            offset += chunk
+
+        while n - offset >= self.DATA_SIZE:
+            for j in range(self.DATA_SIZE):
+                self.data[j] ^= b[offset + j]
+            offset += self.DATA_SIZE
+
+        if offset < n:
+            rem = n - offset
+            for j in range(rem):
+                self.data[j] ^= b[offset + j]
+
+        self.length += n
+
+    def digest(self) -> bytes:
+        h = bytearray(21)
+        for i in range(self.DATA_SIZE):
+            shift = (i * 11) % 160
+            sb = shift // 8
+            sbits = shift % 8
+            shifted = self.data[i] << sbits
+            h[sb] ^= (shifted & 0xFF)
+            h[sb + 1] ^= ((shifted >> 8) & 0xFF)
+        h[0] ^= h[20]
+
+        d = self.length
+        for j in range(8):
+            h[20 - 8 + j] ^= ((d >> (8 * j)) & 0xFF)
+
+        return bytes(h[:20])
+
+    def b64digest(self) -> str:
+        return base64.b64encode(self.digest()).decode("ascii")
+
+
+def compute_file_quickxorhash(file_path: str, chunk_size: int = 65536) -> str:
+    """Computes base64 QuickXorHash for a local file."""
+    hasher = QuickXorHash()
+    with open(file_path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.b64digest()
+
+
+_HASH_CACHE = {}  # (st_ino, st_size, st_mtime_ns) -> b64_hash
+
+def get_cached_quickxorhash(file_path: str, st: os.stat_result = None) -> str:
+    """
+    Returns QuickXorHash for file_path, memoizing results by (st_ino, st_size, st_mtime_ns).
+    Avoids re-reading and re-hashing files that have not changed.
+    """
+    try:
+        if st is None:
+            st = os.stat(file_path)
+        cache_key = (st.st_ino, st.st_size, st.st_mtime_ns)
+        cached = _HASH_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        computed = compute_file_quickxorhash(file_path)
+        _HASH_CACHE[cache_key] = computed
+        if len(_HASH_CACHE) > 10000:
+            for k in list(_HASH_CACHE.keys())[:2000]:
+                del _HASH_CACHE[k]
+        return computed
+    except OSError:
+        return None
+
+
+def is_item_cached(content_dir: str, item_id: str, remote_size: int = 0, expected_hash: str = None) -> bool:
+    """
+    Verifies if an item is physically, regularly and verified-cached on disk.
+    Requires:
+    1. Target file exists in content_dir, is regular file (stat.S_ISREG), not a symlink.
+    2. Size matches exact remote size (if remote_size is valid >= 0).
+    3. If expected_hash (QuickXorHash) is provided, computed QuickXorHash must match.
     """
     if not content_dir or not item_id:
         return False
@@ -156,15 +254,22 @@ def is_item_cached(content_dir: str, item_id: str, remote_size: int = 0) -> bool
         st = os.stat(target_file)
         if not stat.S_ISREG(st.st_mode):
             return False
-        return st.st_size == int(remote_size)
+        if st.st_size != int(remote_size):
+            return False
+        if expected_hash:
+            actual_hash = get_cached_quickxorhash(target_file, st)
+            if actual_hash != expected_hash:
+                return False
+        return True
     except OSError:
         return False
 
-def compute_cache_status(content_dir: str, path_to_item: dict, known_folders: set = None) -> dict:
+
+def compute_cache_status(content_dir: str, path_to_item: dict, known_folders: set = None, id_to_item: dict = None) -> dict:
     """
     Computes cached_ids, cached_folders, and cloud_folders by checking physical files
-    in content_dir against items in path_to_item.
-    Pre-scans content_dir to avoid tens of thousands of individual os.stat disk syscalls.
+    in content_dir against items in path_to_item with QuickXorHash validation.
+    Optimized: scans content_dir and only hashes files present in local cache.
     """
     cached_ids = set()
     cached_folders = set()
@@ -173,7 +278,7 @@ def compute_cache_status(content_dir: str, path_to_item: dict, known_folders: se
         known_folders = set()
 
     if content_dir and os.path.isdir(content_dir) and path_to_item:
-        local_files = {}
+        local_entries = {}
         try:
             with os.scandir(content_dir) as it:
                 for entry in it:
@@ -181,21 +286,35 @@ def compute_cache_status(content_dir: str, path_to_item: dict, known_folders: se
                         try:
                             st = entry.stat()
                             if stat.S_ISREG(st.st_mode):
-                                local_files[entry.name] = st.st_size
+                                local_entries[entry.name] = (entry.path, st)
                         except OSError:
                             pass
         except OSError:
             pass
 
+        if id_to_item is None:
+            id_to_item = {info["id"]: info for info in path_to_item.values()}
+
+        # Verify only items that physically exist in local_entries
+        for item_id, (target_file, st) in local_entries.items():
+            item_info = id_to_item.get(item_id)
+            if not item_info:
+                continue
+            remote_size = item_info.get("size", 0)
+            if remote_size is None or int(remote_size) < 0 or st.st_size != int(remote_size):
+                continue
+            expected_hash = item_info.get("hash")
+            if expected_hash:
+                actual_hash = get_cached_quickxorhash(target_file, st)
+                if actual_hash != expected_hash:
+                    continue
+            cached_ids.add(item_id)
+
+        # Folder status propagation
         for rel_path, item_info in path_to_item.items():
             item_id = item_info["id"]
-            remote_size = item_info.get("size", 0)
-            local_size = local_files.get(item_id)
-            is_cached = (local_size is not None and remote_size is not None and int(remote_size) >= 0 and local_size == int(remote_size))
-
             parts = rel_path.split("/")
-            if is_cached:
-                cached_ids.add(item_id)
+            if item_id in cached_ids:
                 cached_folders.add("")
                 for i in range(1, len(parts)):
                     cached_folders.add("/".join(parts[:i]))
@@ -337,6 +456,7 @@ def read_bbolt_db(db_path: str, content_dir: str = None) -> dict:
 
         path_to_item = {}
         id_to_path = {}
+        id_to_item = {}
         known_folders = set()
 
         for key_b, val_b in meta_items:
@@ -350,10 +470,15 @@ def read_bbolt_db(db_path: str, content_dir: str = None) -> dict:
             if not item_id or not name:
                 continue
 
+            name = unicodedata.normalize("NFC", name)
             parent_ref = obj.get("parentReference") or {}
             raw_path = parent_ref.get("path", "")
-            clean_parent = raw_path.replace("/drive/root:", "").lstrip("/")
-            rel_path = os.path.normpath(os.path.join(clean_parent, name))
+            if "root:" in raw_path:
+                clean_parent = raw_path.split("root:", 1)[1].lstrip("/")
+            else:
+                clean_parent = raw_path.lstrip("/")
+            clean_parent = unicodedata.normalize("NFC", clean_parent)
+            rel_path = unicodedata.normalize("NFC", os.path.normpath(os.path.join(clean_parent, name)))
             if rel_path == ".":
                 continue
 
@@ -362,23 +487,29 @@ def read_bbolt_db(db_path: str, content_dir: str = None) -> dict:
                 known_folders.add(rel_path)
             else:
                 size = obj.get("size", 0)
+                file_facet = obj.get("file") or {}
+                hashes = file_facet.get("hashes") or {}
+                quick_hash = hashes.get("quickXorHash")
                 item_info = {
                     "id": item_id,
                     "name": name,
                     "size": size,
+                    "hash": quick_hash,
                     "rel_path": rel_path
                 }
                 path_to_item[rel_path] = item_info
                 id_to_path[item_id] = rel_path
+                id_to_item[item_id] = item_info
 
         result["path_to_item"] = path_to_item
         result["id_to_path"] = id_to_path
+        result["id_to_item"] = id_to_item
         result["known_folders"] = known_folders
         result["read_success"] = True
 
         # Precompute folder and cache status if content_dir is provided
         if content_dir and os.path.isdir(content_dir):
-            cache_status = compute_cache_status(content_dir, path_to_item, known_folders)
+            cache_status = compute_cache_status(content_dir, path_to_item, known_folders, id_to_item)
             result.update(cache_status)
 
         return result

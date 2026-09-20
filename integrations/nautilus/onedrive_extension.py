@@ -11,10 +11,11 @@ import sys
 import time
 import threading
 import subprocess
+import unicodedata
 import gi
 
 gi.require_version('Nautilus', '4.1')
-from gi.repository import Nautilus, GObject, GLib
+from gi.repository import Nautilus, GObject, GLib, Gio
 
 # Ensure onedrive_core can be imported whether installed or run from source tree
 _this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -39,6 +40,8 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
     def __init__(self):
         super().__init__()
         self._sync_lock = threading.Lock()
+        self._active_files_lock = threading.Lock()
+        self._active_files = {}  # file_path -> Nautilus.FileInfo
         self.cache_base = onedrive_core.get_cache_base()
         self.mounts = {}
         self.last_mount_check = 0
@@ -48,6 +51,41 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
             GLib.timeout_add_seconds(5, self._periodic_check)
         except Exception:
             pass
+
+    def _register_active_file(self, file_path: str, file_info: Nautilus.FileInfo):
+        with self._active_files_lock:
+            self._active_files[file_path] = file_info
+            if len(self._active_files) > 6000:
+                for k in list(self._active_files.keys())[:3000]:
+                    del self._active_files[k]
+
+    def _invalidate_active_files_for_mount(self, mp: str):
+        with self._active_files_lock:
+            targets = [f for path, f in self._active_files.items() if path == mp or path.startswith(mp + "/")]
+        for f in targets:
+            try:
+                f.invalidate_extension_info()
+            except Exception:
+                pass
+
+    def _on_content_dir_changed(self, monitor, file, other_file, event_type, mount_info):
+        if event_type in (
+            Gio.FileMonitorEvent.CHANGES_DONE_HINT,
+            Gio.FileMonitorEvent.CREATED,
+            Gio.FileMonitorEvent.DELETED,
+            Gio.FileMonitorEvent.ATTRIBUTE_CHANGED
+        ):
+            with mount_info["lock"]:
+                timer_id = mount_info.get("reload_timer_id")
+                if timer_id:
+                    GLib.source_remove(timer_id)
+                mount_info["reload_timer_id"] = GLib.timeout_add(150, self._trigger_content_reload, mount_info)
+
+    def _trigger_content_reload(self, mount_info):
+        with mount_info["lock"]:
+            mount_info["reload_timer_id"] = None
+        self._load_db_if_needed(mount_info, force=True, invalidate_all_active=True)
+        return False
 
     def _periodic_check(self):
         try:
@@ -89,12 +127,14 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                     if mp in self.mounts:
                         # Update existing dictionary in-place to prevent stranding workers (B3)
                         m = self.mounts[mp]
+                        m["mp"] = mp
                         m["cache_dir"] = entry_path
                         m["db_path"] = os.path.join(entry_path, "onedriver.db")
                         m["content_dir"] = os.path.join(entry_path, "content")
                         m["encoded"] = entry
                     else:
                         m = {
+                            "mp": mp,
                             "cache_dir": entry_path,
                             "db_path": os.path.join(entry_path, "onedriver.db"),
                             "content_dir": os.path.join(entry_path, "content"),
@@ -114,12 +154,26 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                         # so the very first update_file_info call has data!
                         self._load_db_if_needed(m)
 
+                    if "monitor" not in m and os.path.isdir(m["content_dir"]):
+                        try:
+                            gf = Gio.File.new_for_path(m["content_dir"])
+                            mon = gf.monitor_directory(Gio.FileMonitorFlags.NONE, None)
+                            mon.connect("changed", self._on_content_dir_changed, m)
+                            m["monitor"] = mon
+                        except Exception:
+                            pass
+
         # Remove unmounted or deleted accounts
         for stale_mp in list(self.mounts.keys()):
             if stale_mp not in discovered_mps:
-                del self.mounts[stale_mp]
+                stale_info = self.mounts.pop(stale_mp, None)
+                if stale_info and "monitor" in stale_info:
+                    try:
+                        stale_info["monitor"].cancel()
+                    except Exception:
+                        pass
 
-    def _load_db_if_needed(self, mount_info: dict, file_or_files=None, force=False):
+    def _load_db_if_needed(self, mount_info: dict, file_or_files=None, force=False, invalidate_all_active=False):
         db_path = mount_info["db_path"]
         content_dir = mount_info["content_dir"]
 
@@ -198,7 +252,8 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                     if current_snap and current_snap.get("read_success"):
                         path_to_item = current_snap.get("path_to_item", {})
                         known_folders = current_snap.get("known_folders", set())
-                        cache_status = onedrive_core.compute_cache_status(content_dir, path_to_item, known_folders)
+                        id_to_item = current_snap.get("id_to_item")
+                        cache_status = onedrive_core.compute_cache_status(content_dir, path_to_item, known_folders, id_to_item)
                         snapshot = dict(current_snap)
                         snapshot.update(cache_status)
                     else:
@@ -228,11 +283,14 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                     to_invalidate = list(mount_info["pending_invalidation"])
                     mount_info["pending_invalidation"].clear()
 
-                for f in to_invalidate:
-                    try:
-                        f.invalidate_extension_info()
-                    except Exception:
-                        pass
+                if invalidate_all_active:
+                    self._invalidate_active_files_for_mount(mount_info.get("mp", ""))
+                else:
+                    for f in to_invalidate:
+                        try:
+                            f.invalidate_extension_info()
+                        except Exception:
+                            pass
                 return False
 
             GLib.idle_add(apply_snapshot)
@@ -257,6 +315,9 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
             if not file_path:
                 return Nautilus.OperationResult.COMPLETE
 
+            file_path = unicodedata.normalize("NFC", file_path)
+            self._register_active_file(file_path, file)
+
             mp, mount_info = self._match_mount(file_path)
             if not mp or not mount_info:
                 return Nautilus.OperationResult.COMPLETE
@@ -280,6 +341,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
 
             snapshot = mount_info["snapshot"]
             rel_path = "" if file_path == mp else os.path.relpath(file_path, mp)
+            rel_path = unicodedata.normalize("NFC", rel_path)
 
             if file.is_directory():
                 has_cached = rel_path in snapshot["cached_folders"]
@@ -321,6 +383,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
             if not file_path:
                 continue
 
+            file_path = unicodedata.normalize("NFC", file_path)
             mp, mount_info = self._match_mount(file_path)
             if not mp or not mount_info:
                 continue
@@ -329,6 +392,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
             snapshot = mount_info.get("snapshot") or {}
             cached_ids = snapshot.get("cached_ids", set())
             rel_path = "" if file_path == mp else os.path.relpath(file_path, mp)
+            rel_path = unicodedata.normalize("NFC", rel_path)
             path_to_item = snapshot.get("path_to_item", {})
 
             is_dir = file.is_directory()
@@ -471,18 +535,20 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                         for root_dir, _, filenames in os.walk(file_path, onerror=walk_error):
                             for fn in filenames:
                                 fp = os.path.join(root_dir, fn)
-                                rel_f = os.path.relpath(fp, mp)
+                                rel_f = unicodedata.normalize("NFC", os.path.relpath(fp, mp))
                                 item = path_to_item.get(rel_f)
                                 cid_f = item["id"] if item else None
                                 remote_size = item["size"] if item else 0
+                                expected_hash = item.get("hash") if item else None
 
                                 with self._sync_lock:
                                     self.syncing_paths.add(fp)
+                                preset_cached = bool(cid_f and onedrive_core.is_item_cached(content_dir, cid_f, remote_size, expected_hash))
                                 try:
                                     with open(fp, "rb") as f:
                                         while f.readinto(mv):
                                             pass
-                                    if cid_f and onedrive_core.is_item_cached(content_dir, cid_f, remote_size):
+                                    if preset_cached:
                                         already_cached += 1
                                     else:
                                         downloaded += 1
@@ -492,16 +558,19 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                                     with self._sync_lock:
                                         self.syncing_paths.discard(fp)
                     else:
-                        item = path_to_item.get(rel_path)
+                        norm_rel = unicodedata.normalize("NFC", rel_path)
+                        item = path_to_item.get(norm_rel)
                         remote_size = item["size"] if item else 0
+                        expected_hash = item.get("hash") if item else None
 
                         with self._sync_lock:
                             self.syncing_paths.add(file_path)
+                        preset_cached = bool(item_id and onedrive_core.is_item_cached(content_dir, item_id, remote_size, expected_hash))
                         try:
                             with open(file_path, "rb") as f:
                                 while f.readinto(mv):
                                     pass
-                            if item_id and onedrive_core.is_item_cached(content_dir, item_id, remote_size):
+                            if preset_cached:
                                 already_cached += 1
                             else:
                                 downloaded += 1
@@ -520,7 +589,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
 
                 # Re-check and update database snapshots for all involved mounts
                 for mi in mounts_involved.values():
-                    self._load_db_if_needed(mi, force=True)
+                    self._load_db_if_needed(mi, force=True, invalidate_all_active=True)
 
                 for file, _, _, _, _, _, _, _ in targets_to_download:
                     try:

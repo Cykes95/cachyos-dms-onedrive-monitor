@@ -7,6 +7,7 @@ Permite seleccionar uno o varios archivos/carpetas en Nautilus y descargarlos pa
 import os
 import sys
 import subprocess
+import unicodedata
 
 # Add extensions directory to path to locate onedrive_core
 _ext_dir = os.path.expanduser("~/.local/share/nautilus-python/extensions")
@@ -116,32 +117,36 @@ try:
             for root_dir, _, filenames in os.walk(target, onerror=walk_error):
                 for fn in filenames:
                     fp = os.path.join(root_dir, fn)
-                    rel_f = os.path.relpath(fp, matched_mp)
+                    rel_f = unicodedata.normalize("NFC", os.path.relpath(fp, matched_mp))
                     item = path_to_item.get(rel_f)
                     cid = item["id"] if item else None
                     remote_size = item["size"] if item else 0
+                    expected_hash = item.get("hash") if item else None
 
+                    preset_cached = bool(cid and onedrive_core.is_item_cached(content_dir, cid, remote_size, expected_hash))
                     try:
                         with open(fp, "rb") as f:
                             while f.readinto(mv):
                                 pass
-                        if cid and onedrive_core.is_item_cached(content_dir, cid, remote_size):
+                        if preset_cached:
                             already_cached_count += 1
                         else:
                             downloaded_count += 1
                     except Exception:
                         failed_count += 1
         else:
-            rel_f = os.path.relpath(target, matched_mp)
+            rel_f = unicodedata.normalize("NFC", os.path.relpath(target, matched_mp))
             item = path_to_item.get(rel_f)
             cid = item["id"] if item else None
             remote_size = item["size"] if item else 0
+            expected_hash = item.get("hash") if item else None
 
+            preset_cached = bool(cid and onedrive_core.is_item_cached(content_dir, cid, remote_size, expected_hash))
             try:
                 with open(target, "rb") as f:
                     while f.readinto(mv):
                         pass
-                if cid and onedrive_core.is_item_cached(content_dir, cid, remote_size):
+                if preset_cached:
                     already_cached_count += 1
                 else:
                     downloaded_count += 1
