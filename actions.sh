@@ -128,8 +128,8 @@ case "$cmd" in
         fi
         # Remove onedriver.db to compact metadata and reset cache size completely
         rm -f "$cache_dir/$encoded/onedriver.db" 2>/dev/null || true
-        # Reset cached size file so monitor immediately recalculates
-        rm -f "/tmp/onedriver_cache_${encoded}.tmp" 2>/dev/null || true
+        # Reset all cached files so monitor immediately recalculates
+        rm -f /tmp/onedriver_*_"${encoded}.tmp" 2>/dev/null || true
         if [ "$was_active" -eq 1 ]; then
             systemctl --user start "$unit" 2>/dev/null || true
         fi
@@ -142,7 +142,7 @@ case "$cmd" in
         systemctl --user stop "$unit" 2>/dev/null || true
         systemctl --user disable "$unit" 2>/dev/null || true
         rm -rf "$cache_dir/$encoded" 2>/dev/null || true
-        rm -f "/tmp/onedriver_cache_${encoded}.tmp" 2>/dev/null || true
+        rm -f /tmp/onedriver_*_"${encoded}.tmp" 2>/dev/null || true
         echo "removed mount $encoded"
         exit 0
         ;;

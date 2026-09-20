@@ -10,9 +10,10 @@ import os
 import re
 import time
 import urllib.parse
+import threading
 import gi
 gi.require_version('Nautilus', '4.1')
-from gi.repository import Nautilus, GObject, Gio
+from gi.repository import Nautilus, GObject, Gio, GLib
 
 class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuProvider):
     def __init__(self):
@@ -128,6 +129,22 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
             cached = set()
 
         self.cached_ids[mp] = (cached, now)
+
+        # Precompute cached folders for instant O(1) directory lookups
+        cached_folders = set()
+        cloud_folders = set()
+        path_to_id = mount_info.get("path_to_id", {})
+        for p, cid in path_to_id.items():
+            parts = p.split("/")
+            if cid in cached:
+                for i in range(1, len(parts)):
+                    cached_folders.add("/".join(parts[:i]))
+            else:
+                for i in range(1, len(parts)):
+                    cloud_folders.add("/".join(parts[:i]))
+
+        mount_info["cached_folders"] = cached_folders
+        mount_info["cloud_folders"] = cloud_folders
         return cached
 
     def _match_mount(self, file_path: str):
@@ -163,22 +180,11 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
             item_id = path_to_id.get(rel_path)
 
             if file.is_directory():
-                # For directories, check if any child files are cached
-                has_cached_child = False
-                has_cloud_child = False
-                prefix = rel_path + "/"
-                for p, cid in path_to_id.items():
-                    if p.startswith(prefix):
-                        if cid in cached_ids:
-                            has_cached_child = True
-                        else:
-                            has_cloud_child = True
-                        if has_cached_child and has_cloud_child:
-                            break
-
-                if has_cached_child:
+                has_cached = rel_path in mount_info.get("cached_folders", set())
+                has_cloud = rel_path in mount_info.get("cloud_folders", set())
+                if has_cached:
                     file.add_emblem("onedrive-custom-synced")
-                elif has_cloud_child:
+                elif has_cloud:
                     file.add_emblem("onedrive-custom-cloud")
             else:
                 # For files
@@ -223,11 +229,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
 
             is_downloaded = False
             if is_dir:
-                prefix = rel_path + "/"
-                for p, cid in path_to_id.items():
-                    if p.startswith(prefix) and cid in cached_ids:
-                        is_downloaded = True
-                        break
+                is_downloaded = rel_path in mount_info.get("cached_folders", set())
             else:
                 is_downloaded = bool(item_id and item_id in cached_ids)
 
@@ -267,57 +269,62 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
         return menu_items
 
     def _on_free_space_activate(self, menu_item, onedrive_files):
-        for file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded in onedrive_files:
-            content_dir = mount_info.get("content_dir")
-            path_to_id = mount_info.get("path_to_id", {})
-            if not content_dir or not os.path.isdir(content_dir):
-                continue
+        def worker():
+            for file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded in onedrive_files:
+                content_dir = mount_info.get("content_dir")
+                path_to_id = mount_info.get("path_to_id", {})
+                if not content_dir or not os.path.isdir(content_dir):
+                    continue
 
-            if is_dir:
-                prefix = rel_path + "/"
-                for p, cid in path_to_id.items():
-                    if p.startswith(prefix):
-                        cf = os.path.join(content_dir, cid)
+                if is_dir:
+                    prefix = rel_path + "/"
+                    for p, cid in path_to_id.items():
+                        if p.startswith(prefix):
+                            cf = os.path.join(content_dir, cid)
+                            if os.path.isfile(cf):
+                                try:
+                                    os.remove(cf)
+                                except Exception:
+                                    pass
+                else:
+                    if item_id:
+                        cf = os.path.join(content_dir, item_id)
                         if os.path.isfile(cf):
                             try:
                                 os.remove(cf)
                             except Exception:
                                 pass
-            else:
-                if item_id:
-                    cf = os.path.join(content_dir, item_id)
-                    if os.path.isfile(cf):
-                        try:
-                            os.remove(cf)
-                        except Exception:
-                            pass
 
-            try:
-                file.invalidate_extension_info()
-            except Exception:
-                pass
-
-    def _on_download_activate(self, menu_item, onedrive_files):
-        # Trigger read of files to download them in background
-        for file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded in onedrive_files:
-            if is_dir:
-                # Walk directory and touch files to download
-                for root_dir, _, filenames in os.walk(file_path):
-                    for fn in filenames:
-                        fp = os.path.join(root_dir, fn)
-                        try:
-                            with open(fp, "rb") as f:
-                                f.read(1)
-                        except Exception:
-                            pass
-            else:
                 try:
-                    with open(file_path, "rb") as f:
-                        f.read(1)
+                    GLib.idle_add(file.invalidate_extension_info)
                 except Exception:
                     pass
 
-            try:
-                file.invalidate_extension_info()
-            except Exception:
-                pass
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_download_activate(self, menu_item, onedrive_files):
+        def worker():
+            for file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded in onedrive_files:
+                if is_dir:
+                    # Walk directory and touch files to download
+                    for root_dir, _, filenames in os.walk(file_path):
+                        for fn in filenames:
+                            fp = os.path.join(root_dir, fn)
+                            try:
+                                with open(fp, "rb") as f:
+                                    f.read(1)
+                            except Exception:
+                                pass
+                else:
+                    try:
+                        with open(file_path, "rb") as f:
+                            f.read(1)
+                    except Exception:
+                        pass
+
+                try:
+                    GLib.idle_add(file.invalidate_extension_info)
+                except Exception:
+                    pass
+
+        threading.Thread(target=worker, daemon=True).start()
