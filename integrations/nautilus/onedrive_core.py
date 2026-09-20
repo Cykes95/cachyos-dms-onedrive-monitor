@@ -164,6 +164,7 @@ def compute_cache_status(content_dir: str, path_to_item: dict, known_folders: se
     """
     Computes cached_ids, cached_folders, and cloud_folders by checking physical files
     in content_dir against items in path_to_item.
+    Pre-scans content_dir to avoid tens of thousands of individual os.stat disk syscalls.
     """
     cached_ids = set()
     cached_folders = set()
@@ -172,10 +173,25 @@ def compute_cache_status(content_dir: str, path_to_item: dict, known_folders: se
         known_folders = set()
 
     if content_dir and os.path.isdir(content_dir) and path_to_item:
+        local_files = {}
+        try:
+            with os.scandir(content_dir) as it:
+                for entry in it:
+                    if entry.is_file(follow_symlinks=False):
+                        try:
+                            st = entry.stat()
+                            if stat.S_ISREG(st.st_mode):
+                                local_files[entry.name] = st.st_size
+                        except OSError:
+                            pass
+        except OSError:
+            pass
+
         for rel_path, item_info in path_to_item.items():
             item_id = item_info["id"]
             remote_size = item_info.get("size", 0)
-            is_cached = is_item_cached(content_dir, item_id, remote_size)
+            local_size = local_files.get(item_id)
+            is_cached = (local_size is not None and remote_size is not None and int(remote_size) >= 0 and local_size == int(remote_size))
 
             parts = rel_path.split("/")
             if is_cached:
