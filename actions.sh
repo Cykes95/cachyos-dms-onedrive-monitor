@@ -4,8 +4,8 @@
 # Manages systemd units, caching, and onedriver lifecycle
 
 home_dir=${HOME:-$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)}
-config_file="$home_dir/.config/onedriver/config.yml"
-cache_dir="$home_dir/.cache/onedriver"
+config_file="${XDG_CONFIG_HOME:-$home_dir/.config}/onedriver/config.yml"
+cache_dir="${XDG_CACHE_HOME:-$home_dir/.cache}/onedriver"
 script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 
 runtime_dir="${XDG_RUNTIME_DIR:-/tmp}/onedriver_dms"
@@ -59,7 +59,7 @@ validate_encoded() {
 
 ensure_systemd_override() {
     fusermount_bin=$(command -v fusermount3 || command -v fusermount || echo /usr/bin/fusermount3)
-    systemd_override_dir="$home_dir/.config/systemd/user/onedriver@.service.d"
+    systemd_override_dir="${XDG_CONFIG_HOME:-$home_dir/.config}/systemd/user/onedriver@.service.d"
     if [ ! -f "$systemd_override_dir/override.conf" ]; then
         mkdir -p "$systemd_override_dir" 2>/dev/null || true
         printf '[Service]\nExecStopPost=\nExecStopPost=-%s -uz /%%I\n' "$fusermount_bin" > "$systemd_override_dir/override.conf" 2>/dev/null || true
@@ -72,6 +72,7 @@ shift 1 2>/dev/null || true
 
 case "$cmd" in
     start)
+        [ -n "$1" ] || { echo "Error: falta el identificador o nombre de unidad" >&2; exit 1; }
         ensure_systemd_override
         unit=$(normalize_unit "$1")
         if out=$(systemctl --user start "$unit" 2>&1); then
@@ -83,6 +84,7 @@ case "$cmd" in
         fi
         ;;
     stop)
+        [ -n "$1" ] || { echo "Error: falta el identificador o nombre de unidad" >&2; exit 1; }
         unit=$(normalize_unit "$1")
         if out=$(systemctl --user stop "$unit" 2>&1); then
             echo "stopped $unit"
@@ -93,6 +95,7 @@ case "$cmd" in
         fi
         ;;
     restart)
+        [ -n "$1" ] || { echo "Error: falta el identificador o nombre de unidad" >&2; exit 1; }
         ensure_systemd_override
         unit=$(normalize_unit "$1")
         if out=$(systemctl --user restart "$unit" 2>&1); then
@@ -104,6 +107,7 @@ case "$cmd" in
         fi
         ;;
     enable)
+        [ -n "$1" ] || { echo "Error: falta el identificador o nombre de unidad" >&2; exit 1; }
         unit=$(normalize_unit "$1")
         if out=$(systemctl --user enable "$unit" 2>&1); then
             echo "enabled $unit"
@@ -114,6 +118,7 @@ case "$cmd" in
         fi
         ;;
     disable)
+        [ -n "$1" ] || { echo "Error: falta el identificador o nombre de unidad" >&2; exit 1; }
         unit=$(normalize_unit "$1")
         if out=$(systemctl --user disable "$unit" 2>&1); then
             echo "disabled $unit"
@@ -124,6 +129,7 @@ case "$cmd" in
         fi
         ;;
     toggle-autostart)
+        [ -n "$1" ] || { echo "Error: falta el identificador o nombre de unidad" >&2; exit 1; }
         unit=$(normalize_unit "$1")
         state=$(systemctl --user is-enabled "$unit" 2>/dev/null || true)
         case "$state" in
@@ -239,6 +245,8 @@ case "$cmd" in
             exit 1
         fi
         systemctl --user disable "$unit" 2>/dev/null || true
+        systemctl --user reset-failed "$unit" 2>/dev/null || true
+        systemctl --user daemon-reload 2>/dev/null || true
         fusermount_bin=$(command -v fusermount3 || command -v fusermount || true)
         if [ -n "$mountpoint" ] && [ -n "$fusermount_bin" ]; then
             "$fusermount_bin" -uz "$mountpoint" 2>/dev/null || true
@@ -249,14 +257,10 @@ case "$cmd" in
         exit 0
         ;;
     open-cache)
-        if [ -d "$cache_dir" ]; then
-            xdg-open "$cache_dir" >/dev/null 2>&1 &
-            echo "cache opened"
-            exit 0
-        else
-            echo "cache directory not found: $cache_dir" >&2
-            exit 1
-        fi
+        mkdir -p "$cache_dir" 2>/dev/null || true
+        xdg-open "$cache_dir" >/dev/null 2>&1 &
+        echo "cache opened"
+        exit 0
         ;;
     open-launcher)
         if command -v onedriver-launcher >/dev/null 2>&1; then
@@ -269,10 +273,12 @@ case "$cmd" in
         fi
         ;;
     install-nautilus)
-        icons_dir="$home_dir/.local/share/icons/hicolor"
-        ext_dir="$home_dir/.local/share/nautilus-python/extensions"
-        scripts_dir="$home_dir/.local/share/nautilus/scripts"
-        systemd_override_dir="$home_dir/.config/systemd/user/onedriver@.service.d"
+        data_home="${XDG_DATA_HOME:-$home_dir/.local/share}"
+        config_home="${XDG_CONFIG_HOME:-$home_dir/.config}"
+        icons_dir="$data_home/icons/hicolor"
+        ext_dir="$data_home/nautilus-python/extensions"
+        scripts_dir="$data_home/nautilus/scripts"
+        systemd_override_dir="$config_home/systemd/user/onedriver@.service.d"
 
         mkdir -p "$icons_dir/scalable/emblems" "$icons_dir/48x48/emblems" "$ext_dir" "$scripts_dir" "$systemd_override_dir"
 
@@ -303,14 +309,16 @@ case "$cmd" in
             fi
         fi
 
-        src_script="$script_dir/integrations/nautilus/OneDrive - Liberar espacio local"
-        dest_script="$scripts_dir/OneDrive - Liberar espacio local"
-        if [ -f "$src_script" ]; then
-            if [ ! -f "$dest_script" ] || ! cmp -s "$src_script" "$dest_script"; then
-                cp -f "$src_script" "$dest_script" 2>/dev/null || true
-                chmod +x "$dest_script" 2>/dev/null || true
+        for script_name in "OneDrive - Liberar espacio local" "OneDrive - Descargar en este equipo"; do
+            src_script="$script_dir/integrations/nautilus/$script_name"
+            dest_script="$scripts_dir/$script_name"
+            if [ -f "$src_script" ]; then
+                if [ ! -f "$dest_script" ] || ! cmp -s "$src_script" "$dest_script"; then
+                    cp -f "$src_script" "$dest_script" 2>/dev/null || true
+                    chmod +x "$dest_script" 2>/dev/null || true
+                fi
             fi
-        fi
+        done
 
         if [ "$needs_icon_cache" -eq 1 ] && command -v gtk-update-icon-cache >/dev/null 2>&1; then
             gtk-update-icon-cache -f -t "$icons_dir" 2>/dev/null || true
@@ -331,10 +339,11 @@ case "$cmd" in
         exit 0
         ;;
     uninstall-nautilus)
-        ext_dir="$home_dir/.local/share/nautilus-python/extensions"
-        scripts_dir="$home_dir/.local/share/nautilus/scripts"
+        data_home="${XDG_DATA_HOME:-$home_dir/.local/share}"
+        ext_dir="$data_home/nautilus-python/extensions"
+        scripts_dir="$data_home/nautilus/scripts"
         rm -f "$ext_dir/onedrive_extension.py" 2>/dev/null || true
-        rm -f "$scripts_dir/OneDrive - Liberar espacio local" 2>/dev/null || true
+        rm -f "$scripts_dir/OneDrive - Liberar espacio local" "$scripts_dir/OneDrive - Descargar en este equipo" 2>/dev/null || true
         if pgrep -x nautilus >/dev/null 2>&1; then
             nautilus -q 2>/dev/null || true
         fi
@@ -349,7 +358,8 @@ case "$cmd" in
         exit 0
         ;;
     status-nautilus)
-        ext_dir="$home_dir/.local/share/nautilus-python/extensions"
+        data_home="${XDG_DATA_HOME:-$home_dir/.local/share}"
+        ext_dir="$data_home/nautilus-python/extensions"
         if [ -f "$ext_dir/onedrive_extension.py" ]; then
             echo "installed"
         else

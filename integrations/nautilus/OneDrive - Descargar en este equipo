@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-Nautilus Script: Liberar espacio local de OneDrive
-Permite seleccionar uno o varios archivos/carpetas en Nautilus y liberar su espacio local.
+Nautilus Script: Descargar en este equipo (OneDrive)
+Permite seleccionar uno o varios archivos/carpetas en Nautilus y descargarlos para uso sin conexión.
 """
 
 import os
 import sys
 import subprocess
+import mmap
+import re
 
 selected_paths = os.environ.get("NAUTILUS_SCRIPT_SELECTED_FILE_PATHS", "").strip().split("\n")
 if not selected_paths or selected_paths == [""]:
@@ -15,14 +17,16 @@ if not selected_paths or selected_paths == [""]:
 if not selected_paths or selected_paths == [""]:
     sys.exit(0)
 
-cache_base = os.path.expanduser("~/.cache/onedriver")
-config_file = os.path.expanduser("~/.config/onedriver/config.yml")
+home_dir = os.path.expanduser("~")
+cache_base = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.join(home_dir, ".cache")), "onedriver")
+config_file = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.join(home_dir, ".config")), "onedriver/config.yml")
+
 if os.path.isfile(config_file):
     try:
         with open(config_file, "r", encoding="utf-8") as f:
             for line in f:
                 if line.strip().startswith("cacheDir:"):
-                    val = line.split(":", 1)[1].strip()
+                    val = line.split(":", 1)[1].strip().strip("\"'")
                     if val.startswith("~"):
                         cache_base = os.path.expanduser(val)
                     elif val.startswith("/"):
@@ -33,9 +37,6 @@ if os.path.isfile(config_file):
 
 if not os.path.isdir(cache_base):
     sys.exit(0)
-
-import mmap
-import re
 
 def _unescape_systemd(encoded: str) -> str:
     result = []
@@ -81,12 +82,12 @@ for name in os.listdir(cache_base):
 pattern = re.compile(rb'\{"id":"([A-Za-z0-9!_-]+)","name":"([^"]+)".*?"parentReference":\{.*?"path":"([^"]*)".*?,"(file|folder)":', re.DOTALL)
 db_cache = {}
 
-def get_db_items(db_path):
+def get_db_info(db_path):
     if db_path in db_cache:
         return db_cache[db_path]
-    items = []
+    path_to_id = {}
     if not os.path.isfile(db_path) or os.path.getsize(db_path) == 0:
-        return items
+        return path_to_id
     try:
         with open(db_path, "rb") as f:
             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
@@ -98,20 +99,22 @@ def get_db_items(db_path):
             clean_name = name_b.decode("utf-8", errors="ignore")
             item_rel = os.path.normpath(os.path.join(clean_parent.lstrip("/"), clean_name))
             item_id = item_id_b.decode("utf-8", errors="ignore")
-            items.append((item_id, item_rel))
+            path_to_id[item_rel] = item_id
     except Exception:
         pass
-    db_cache[db_path] = items
-    return items
+    db_cache[db_path] = path_to_id
+    return path_to_id
 
-freed_count = 0
+downloaded_count = 0
+buf = bytearray(1024 * 1024)
+mv = memoryview(buf)
 
 for target in selected_paths:
     target = target.strip()
     if not target:
         continue
 
-    # Find matching mount (longest mountpoint first)
+    # Match mount
     matched_mp = None
     matched_info = None
     for mp in sorted(mounts.keys(), key=len, reverse=True):
@@ -128,37 +131,50 @@ for target in selected_paths:
     if not os.path.isdir(content_dir) or not os.path.isfile(db_path):
         continue
 
-    rel_path = os.path.relpath(target, matched_mp)
-    is_root = (rel_path == ".")
-    is_dir = is_root or os.path.isdir(target)
-    target_prefix = "" if is_root else (rel_path + "/")
+    cached_ids = set()
+    if os.path.isdir(content_dir):
+        try:
+            cached_ids = set(os.listdir(content_dir))
+        except Exception:
+            pass
 
-    db_items = get_db_items(db_path)
+    path_to_id = get_db_info(db_path)
+    is_dir = (target == matched_mp) or os.path.isdir(target)
 
-    for item_id, item_rel in db_items:
-        should_free = False
-        if is_root:
-            should_free = True
-        elif is_dir and item_rel.startswith(target_prefix):
-            should_free = True
-        elif not is_dir and item_rel == rel_path:
-            should_free = True
-
-        if should_free:
-            cached_file = os.path.join(content_dir, item_id)
-            if os.path.isfile(cached_file):
+    if is_dir:
+        for root_dir, _, filenames in os.walk(target):
+            for fn in filenames:
+                fp = os.path.join(root_dir, fn)
+                rel_f = os.path.relpath(fp, matched_mp)
+                cid = path_to_id.get(rel_f)
+                if cid and cid in cached_ids:
+                    continue
                 try:
-                    os.remove(cached_file)
-                    freed_count += 1
+                    with open(fp, "rb") as f:
+                        while f.readinto(mv):
+                            pass
+                    downloaded_count += 1
                 except Exception:
                     pass
+    else:
+        rel_f = os.path.relpath(target, matched_mp)
+        cid = path_to_id.get(rel_f)
+        if cid and cid in cached_ids:
+            continue
+        try:
+            with open(target, "rb") as f:
+                while f.readinto(mv):
+                    pass
+            downloaded_count += 1
+        except Exception:
+            pass
 
-if freed_count > 0:
-    msg = f"Se ha liberado el espacio local de {freed_count} archivo(s)."
+if downloaded_count > 0:
+    msg = f"Se descargaron {downloaded_count} archivo(s) para uso sin conexión."
 else:
-    msg = "Los elementos seleccionados ya estaban solo en la nube."
+    msg = "Los archivos seleccionados ya estaban descargados en este equipo."
 
 try:
-    subprocess.run(["notify-send", "-a", "OneDrive", "-i", "onedrive-custom-cloud", "Espacio liberado", msg])
+    subprocess.run(["notify-send", "-a", "OneDrive", "-i", "onedrive-custom-synced", "Descarga de OneDrive", msg])
 except Exception:
     pass

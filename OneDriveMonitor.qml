@@ -231,11 +231,16 @@ PluginComponent {
             const old = previous.find(item => item.encoded === mount.encoded);
             if (!old)
                 return;
+            const currentKind = activityKind(mount);
+            const oldKind = activityKind(old);
+
             if (mount.active === "failed" && old.active !== "failed") {
                 ToastService.showError("OneDrive", (mount.label || mount.path) + " ha fallado");
-            } else if (activityKind(mount) === "offline" && activityKind(old) !== "offline") {
+            } else if (currentKind === "error" && oldKind !== "error") {
+                ToastService.showError("OneDrive", (mount.label || mount.path) + ": " + (mount.activity || "Error en el servicio"));
+            } else if (currentKind === "offline" && oldKind !== "offline") {
                 ToastService.showWarning("OneDrive", (mount.label || mount.path) + " está offline");
-            } else if (activityKind(old) === "offline" && activityKind(mount) === "idle") {
+            } else if (oldKind === "offline" && currentKind === "idle") {
                 ToastService.showInfo("OneDrive", (mount.label || mount.path) + " vuelve a estar online");
             }
         });
@@ -387,6 +392,7 @@ PluginComponent {
         onTriggered: {
             if (root.refreshInFlight) {
                 root.refreshInFlight = false;
+                root.pendingUnits = ({});
             }
         }
     }
@@ -412,6 +418,7 @@ PluginComponent {
                 root.lastError = "";
                 root.parseStatus(monitorOutput.text);
             } else {
+                root.pendingUnits = ({});
                 root.lastError = (monitorError.text || "No se pudo consultar onedriver").trim().split("\n")[0];
             }
         }
@@ -706,7 +713,7 @@ PluginComponent {
                 // Mount Cards Scrollable Area
                 DankFlickable {
                     width: parent.width
-                    height: Math.max(100, root.popoutHeight - 160)
+                    height: Math.max(80, Math.min(cards.implicitHeight, root.popoutHeight - 160))
                     contentWidth: width
                     contentHeight: cards.implicitHeight
                     clip: true
@@ -725,6 +732,7 @@ PluginComponent {
                                 required property var modelData
                                 property var mount: modelData
                                 property bool confirmDelete: false
+                                readonly property bool isBusy: Boolean(root.pendingUnits[mount.encoded]) || actionProcess.running
 
                                 width: cards.width
                                 implicitHeight: cardBg.implicitHeight
@@ -810,6 +818,7 @@ PluginComponent {
                                                 iconName: mount.enabled === "enabled" ? "bolt" : "power_settings_new"
                                                 iconColor: mount.enabled === "enabled" ? Theme.primary : Theme.surfaceVariantText
                                                 buttonSize: 26
+                                                enabled: !cardItem.isBusy
                                                 tooltipText: mount.enabled === "enabled" ? "Inicio automático activado (clic para desactivar)" : "Inicio automático desactivado (clic para activar)"
                                                 onClicked: root.toggleAutostart(mount)
                                                 anchors.verticalCenter: parent.verticalCenter
@@ -890,6 +899,7 @@ PluginComponent {
 
                                                 DankButton {
                                                     text: mount.active === "active" ? "Desmontar" : "Montar"
+                                                    enabled: !cardItem.isBusy
                                                     onClicked: root.toggleMount(mount)
                                                 }
 
@@ -897,6 +907,7 @@ PluginComponent {
                                                     iconName: "restart_alt"
                                                     iconColor: Theme.surfaceVariantText
                                                     buttonSize: 28
+                                                    enabled: !cardItem.isBusy
                                                     tooltipText: "Reiniciar montaje"
                                                     onClicked: root.runAction(mount, "restart")
                                                 }
@@ -913,6 +924,7 @@ PluginComponent {
                                                     iconName: "cleaning_services"
                                                     iconColor: Theme.surfaceVariantText
                                                     buttonSize: 28
+                                                    enabled: !cardItem.isBusy
                                                     tooltipText: "Vaciar archivos de la caché local (sin perder la cuenta)"
                                                     onClicked: root.clearCache(mount)
                                                 }
@@ -921,6 +933,7 @@ PluginComponent {
                                                     iconName: "delete_outline"
                                                     iconColor: Theme.error
                                                     buttonSize: 28
+                                                    enabled: !cardItem.isBusy
                                                     tooltipText: "Desvincular cuenta del equipo"
                                                     onClicked: cardItem.confirmDelete = true
                                                 }
@@ -942,6 +955,7 @@ PluginComponent {
 
                                                 DankButton {
                                                     text: "Sí, desvincular"
+                                                    enabled: !cardItem.isBusy
                                                     onClicked: {
                                                         cardItem.confirmDelete = false;
                                                         root.removeMount(mount);

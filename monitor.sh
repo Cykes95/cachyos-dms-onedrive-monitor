@@ -52,7 +52,11 @@ emit_mount() {
     account_type="work"
     meta_cache_file="$runtime_dir/meta_${encoded}.tmp"
     if [ -r "$meta_cache_file" ]; then
-        IFS='	' read -r label account account_type < "$meta_cache_file" 2>/dev/null || true
+        if [ -f "$token_file" ] && [ "$token_file" -nt "$meta_cache_file" ]; then
+            rm -f "$meta_cache_file" 2>/dev/null || true
+        else
+            IFS='	' read -r label account account_type < "$meta_cache_file" 2>/dev/null || true
+        fi
     fi
 
     if [ -z "$label" ] || [ -z "$account" ]; then
@@ -125,6 +129,11 @@ PROP_EOF
         fi
     elif [ -r /proc/mounts ] && grep -Fqs " $mountpoint " /proc/mounts; then
         mounted=1
+    fi
+
+    # Ignore ghost/unlinked mounts that no longer have tokens, are not running and not mounted
+    if [ ! -f "$token_file" ] && [ "$active" != "active" ] && [ "$mounted" -ne 1 ]; then
+        return 0
     fi
 
     cache_bytes=0
@@ -243,9 +252,10 @@ loaded_units=$(systemctl --user list-units --all --no-legend --no-pager 'onedriv
     | awk '$1 ~ /^onedriver@/ {print $1}' \
     | sed -n 's/^onedriver@\(.*\)\.service$/\1/p')
 
+wants_dir="${XDG_CONFIG_HOME:-$home_dir/.config}/systemd/user/default.target.wants"
 wants_units=""
-if [ -d "$home_dir/.config/systemd/user/default.target.wants" ]; then
-    wants_units=$(find "$home_dir/.config/systemd/user/default.target.wants" -maxdepth 1 -name 'onedriver@*.service' 2>/dev/null \
+if [ -d "$wants_dir" ]; then
+    wants_units=$(find "$wants_dir" -maxdepth 1 -name 'onedriver@*.service' 2>/dev/null \
         | sed -n 's/.*onedriver@\(.*\)\.service$/\1/p')
 fi
 
