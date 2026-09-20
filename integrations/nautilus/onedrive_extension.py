@@ -94,7 +94,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                         m["content_dir"] = os.path.join(entry_path, "content")
                         m["encoded"] = entry
                     else:
-                        self.mounts[mp] = {
+                        m = {
                             "cache_dir": entry_path,
                             "db_path": os.path.join(entry_path, "onedriver.db"),
                             "content_dir": os.path.join(entry_path, "content"),
@@ -109,6 +109,10 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                             "pending_invalidation": set(),
                             "lock": threading.Lock()
                         }
+                        self.mounts[mp] = m
+                        # Preload snapshot immediately on discovery (takes only 15ms)
+                        # so the very first update_file_info call has data!
+                        self._load_db_if_needed(m)
 
         # Remove unmounted or deleted accounts
         for stale_mp in list(self.mounts.keys()):
@@ -144,6 +148,23 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
 
             if not need_db_reload and not need_content_refresh:
                 return
+
+            # Synchronous fast-path on initial load:
+            # When snapshot is not yet loaded, read it synchronously (15ms)
+            # so the first render of Nautilus receives emblems immediately!
+            if mount_info.get("snapshot") is None:
+                try:
+                    snapshot = onedrive_core.read_bbolt_db(db_path, content_dir)
+                    if snapshot and snapshot.get("read_success"):
+                        mount_info["snapshot"] = snapshot
+                        mount_info["mtime"] = db_mtime
+                        mount_info["content_mtime"] = content_mtime
+                        mount_info["txid"] = snapshot.get("txid", 0)
+                        mount_info["db_ready"] = True
+                        mount_info["last_error_time"] = 0
+                        return
+                except Exception:
+                    pass
 
             if mount_info["loading_db"]:
                 # Only register interested FileInfo when a load is actively occurring
