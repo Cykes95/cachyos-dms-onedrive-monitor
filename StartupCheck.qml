@@ -5,7 +5,7 @@ QtObject {
     function check(done) {
         Proc.runCommand(
             "onedriverMonitor.dependencyCheck",
-            ["sh", "-c", "missing=''; for c in onedriver systemctl journalctl findmnt xdg-open; do command -v \"$c\" >/dev/null 2>&1 || missing=\"$missing $c\"; done; if [ -n \"$missing\" ]; then echo \"$missing\"; exit 1; fi"],
+            ["sh", "-c", "missing=''; for c in onedriver systemctl journalctl findmnt xdg-open timeout; do command -v \"$c\" >/dev/null 2>&1 || missing=\"$missing $c\"; done; if [ -n \"$missing\" ]; then echo \"$missing\"; exit 1; fi"],
             (stdout, exitCode) => {
                 if (exitCode === 0) {
                     done(null);

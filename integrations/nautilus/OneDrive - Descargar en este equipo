@@ -44,7 +44,7 @@ def _unescape_systemd(encoded: str) -> str:
     i = 0
     n = len(encoded)
     while i < n:
-        if encoded[i:i+4].startswith(r"\x"):
+        if encoded[i:i+2] == "\\x":
             try:
                 result.append(chr(int(encoded[i+2:i+4], 16)))
                 i += 4

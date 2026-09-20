@@ -76,7 +76,7 @@ emit_mount() {
         fi
     fi
 
-    if [ -z "$label" ] || [ -z "$account" ]; then
+    if [ -z "$label" ] || [ -z "$account" ] || [ -z "$account_type" ]; then
         if [ -r "$label_file" ]; then
             while IFS= read -r line || [ -n "$line" ]; do
                 case "$line" in

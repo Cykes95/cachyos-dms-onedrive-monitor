@@ -8,8 +8,13 @@ config_file="${XDG_CONFIG_HOME:-$home_dir/.config}/onedriver/config.yml"
 cache_dir="${XDG_CACHE_HOME:-$home_dir/.cache}/onedriver"
 script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 
-runtime_dir="${XDG_RUNTIME_DIR:-/tmp}/onedriver_dms"
-mkdir -p "$runtime_dir" 2>/dev/null || runtime_dir="/tmp"
+if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+    runtime_dir="$XDG_RUNTIME_DIR/onedriver_dms"
+else
+    runtime_dir="${TMPDIR:-/tmp}/onedriver_dms_${UID:-$(id -u)}"
+fi
+mkdir -p "$runtime_dir" 2>/dev/null
+chmod 700 "$runtime_dir" 2>/dev/null || true
 
 if [ -r "$config_file" ]; then
     configured_cache=$(sed -n 's/^[[:space:]]*cacheDir:[[:space:]]*//p' "$config_file" | head -n 1)
@@ -184,18 +189,28 @@ case "$cmd" in
         ensure_systemd_override
         failed=0
         failed_units=""
-        if [ -d "$cache_dir" ]; then
-            for d in "$cache_dir"/*; do
-                if [ -d "$d" ] && [ -f "$d/auth_tokens.json" ]; then
-                    enc=$(basename "$d")
-                    u="onedriver@${enc}.service"
-                    if ! systemctl --user start "$u" 2>&1; then
-                        failed=1
-                        failed_units="$failed_units $u"
-                    fi
+        wants_dir="${XDG_CONFIG_HOME:-$home_dir/.config}/systemd/user/default.target.wants"
+        units=$(
+            {
+                if [ -d "$wants_dir" ]; then
+                    find "$wants_dir" -maxdepth 1 -name 'onedriver@*.service' 2>/dev/null | sed -n 's/.*\(onedriver@.*\.service\)$/\1/p'
                 fi
-            done
-        fi
+                if [ -d "$cache_dir" ]; then
+                    for d in "$cache_dir"/*; do
+                        if [ -d "$d" ] && [ -f "$d/auth_tokens.json" ]; then
+                            enc=$(basename "$d")
+                            echo "onedriver@${enc}.service"
+                        fi
+                    done
+                fi
+            } | sort -u
+        )
+        for u in $units; do
+            if ! systemctl --user start "$u" 2>&1; then
+                failed=1
+                failed_units="$failed_units $u"
+            fi
+        done
         if [ "$failed" -eq 1 ]; then
             echo "Error al montar unidades:$failed_units" >&2
             exit 1
@@ -387,8 +402,14 @@ case "$cmd" in
         exit 0
         ;;
     restart-nautilus)
+        was_running=0
         if pgrep -x nautilus >/dev/null 2>&1; then
+            was_running=1
             nautilus -q 2>/dev/null || true
+            sleep 0.5
+        fi
+        if [ "$was_running" -eq 1 ]; then
+            nautilus >/dev/null 2>&1 &
         fi
         echo "nautilus restarted"
         exit 0

@@ -328,8 +328,11 @@ PluginComponent {
     }
 
     function openMount(mount) {
-        if (mount && mount.path)
-            Quickshell.execDetached(["xdg-open", mount.path]);
+        if (!mount || !mount.path) return;
+        if (mount.active !== "active" || mount.mounted !== "1") {
+            runAction(mount, "start");
+        }
+        Quickshell.execDetached(["xdg-open", mount.path]);
     }
 
     function parseStatus(output) {
@@ -401,6 +404,7 @@ PluginComponent {
         onTriggered: {
             if (root.refreshInFlight) {
                 root.refreshInFlight = false;
+                root.pendingBatch = "";
                 root.pendingUnits = ({});
             }
         }
@@ -505,15 +509,25 @@ PluginComponent {
             return root.summary;
         }
 
-        function toggle(): string {
+        function toggle(encoded: string = ""): string {
+            if (encoded) {
+                const m = root.mounts.find(item => item.encoded === encoded);
+                if (m) {
+                    root.toggleMount(m);
+                    return "toggled " + (m.label || m.encoded);
+                }
+            }
             root.togglePrimaryMount();
             return root.summary;
         }
 
-        function restart(): string {
-            if (root.mounts.length > 0)
-                root.runAction(root.mounts[0], "restart");
-            return "restarting";
+        function restart(encoded: string = ""): string {
+            const m = encoded ? root.mounts.find(item => item.encoded === encoded) : (root.mounts.length > 0 ? root.mounts[0] : null);
+            if (m) {
+                root.runAction(m, "restart");
+                return "restarting " + (m.label || m.encoded);
+            }
+            return "no mount found";
         }
 
         function mountAll(): string {

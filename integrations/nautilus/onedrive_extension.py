@@ -58,7 +58,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
         i = 0
         n = len(encoded)
         while i < n:
-            if encoded[i:i+4].startswith(r"\x"):
+            if encoded[i:i+2] == "\\x":
                 try:
                     hex_val = encoded[i+2:i+4]
                     result.append(chr(int(hex_val, 16)))
@@ -348,6 +348,11 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
 
         return menu_items
 
+    def get_background_items(self, current_folder: Nautilus.FileInfo) -> list:
+        if not current_folder:
+            return []
+        return self.get_file_items([current_folder])
+
     def _on_free_space_activate(self, menu_item, onedrive_files):
         def worker():
             mounts_involved = {}
@@ -402,7 +407,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
 
                 for file, _, _, _, _, _, _, _ in onedrive_files:
                     try:
-                        GLib.idle_add(file.invalidate_extension_info)
+                        GLib.idle_add(lambda f=file: (f.invalidate_extension_info(), False)[1])
                     except Exception:
                         pass
 
@@ -507,7 +512,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
 
                 for file, _, _, _, _, _, _, _ in targets_to_download:
                     try:
-                        GLib.idle_add(file.invalidate_extension_info)
+                        GLib.idle_add(lambda f=file: (f.invalidate_extension_info(), False)[1])
                     except Exception:
                         pass
 
