@@ -84,6 +84,8 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
         self.last_mount_check = now
 
         if not os.path.isdir(self.cache_base):
+            self.mounts = {}
+            self.cached_ids.clear()
             return
 
         active_mounts = {}
@@ -103,6 +105,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                         "mtime": prev.get("mtime", 0),
                         "path_to_id": prev.get("path_to_id", {}),
                         "id_to_path": prev.get("id_to_path", {}),
+                        "known_folders": prev.get("known_folders", set()),
                         "io_lock": prev.get("io_lock") or threading.Lock(),
                         "db_lock": prev.get("db_lock") or threading.Lock(),
                         "db_gen": prev.get("db_gen", 0),
@@ -129,15 +132,17 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
 
             path_to_id = {}
             id_to_path = {}
+            known_folders = set()
             for item_id_b, name_b, parent_b, kind_b in matches:
-                if kind_b != b"file":
-                    continue
-                item_id = item_id_b.decode("utf-8", errors="ignore")
                 clean_parent = parent_b.decode("utf-8", errors="ignore").replace("/drive/root:", "")
                 clean_name = name_b.decode("utf-8", errors="ignore")
                 rel_path = os.path.normpath(os.path.join(clean_parent.lstrip("/"), clean_name))
                 if rel_path == ".":
                     continue
+                if kind_b == b"folder":
+                    known_folders.add(rel_path)
+                    continue
+                item_id = item_id_b.decode("utf-8", errors="ignore")
                 path_to_id[rel_path] = item_id
                 id_to_path[item_id] = rel_path
 
@@ -147,6 +152,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                 mount_info["mtime"] = mtime
                 mount_info["path_to_id"] = path_to_id
                 mount_info["id_to_path"] = id_to_path
+                mount_info["known_folders"] = known_folders
                 mount_info["db_ready"] = True
                 cache_dir = mount_info.get("cache_dir")
                 if cache_dir:
@@ -246,6 +252,12 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                 for i in range(1, len(parts)):
                     cloud_folders.add("/".join(parts[:i]))
 
+        # Include empty folders from OneDrive
+        known_folders = mount_info.get("known_folders", set())
+        for f in known_folders:
+            if f and f not in cached_folders:
+                cloud_folders.add(f)
+
         mount_info["cached_folders"] = cached_folders
         mount_info["cloud_folders"] = cloud_folders
         return cached
@@ -296,10 +308,11 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
             if file.is_directory():
                 has_cached = rel_path in mount_info.get("cached_folders", set())
                 has_cloud = rel_path in mount_info.get("cloud_folders", set())
+                known_folders = mount_info.get("known_folders", set())
                 # Only mark folder as completely synced if all its contents are cached locally
                 if has_cached and not has_cloud:
                     file.add_emblem("onedrive-custom-synced")
-                elif has_cloud or has_cached:
+                elif has_cloud or has_cached or rel_path in known_folders:
                     file.add_emblem("onedrive-custom-cloud")
             else:
                 # For files
@@ -406,17 +419,46 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
 
             acquired = []
             flock_files = []
+            lock_failed = False
             for cd in sorted(mounts_involved.keys()):
                 lock = mounts_involved[cd]
-                lock.acquire()
+                if not lock.acquire(timeout=5):
+                    lock_failed = True
+                    break
                 acquired.append(lock)
                 try:
                     lock_file = os.path.join(cd, ".lock")
                     lf = open(lock_file, "w")
-                    fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+                    locked = False
+                    for _ in range(5):
+                        try:
+                            fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            locked = True
+                            break
+                        except (BlockingIOError, OSError):
+                            time.sleep(0.2)
+                    if not locked:
+                        try:
+                            lf.close()
+                        except Exception:
+                            pass
+                        lock_failed = True
+                        break
                     flock_files.append(lf)
                 except Exception:
                     pass
+
+            if lock_failed:
+                for lf in flock_files:
+                    try:
+                        fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+                        lf.close()
+                    except Exception:
+                        pass
+                for lock in reversed(acquired):
+                    lock.release()
+                _notify("OneDrive", "La caché está ocupada por otra operación.", "dialog-warning")
+                return
 
             try:
                 freed = 0
@@ -510,19 +552,58 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
 
             acquired = []
             flock_files = []
+            lock_failed = False
             for cd in sorted(mounts_involved.keys()):
                 lock = mounts_involved[cd]
-                lock.acquire()
+                if not lock.acquire(timeout=5):
+                    lock_failed = True
+                    break
                 acquired.append(lock)
                 try:
                     lock_file = os.path.join(cd, ".lock")
                     lf = open(lock_file, "w")
-                    fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+                    locked = False
+                    for _ in range(5):
+                        try:
+                            fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            locked = True
+                            break
+                        except (BlockingIOError, OSError):
+                            time.sleep(0.2)
+                    if not locked:
+                        try:
+                            lf.close()
+                        except Exception:
+                            pass
+                        lock_failed = True
+                        break
                     flock_files.append(lf)
                 except Exception:
                     pass
 
+            if lock_failed:
+                with self._sync_lock:
+                    for file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded in targets_to_download:
+                        self.syncing_paths.discard(file_path)
+                for lf in flock_files:
+                    try:
+                        fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+                        lf.close()
+                    except Exception:
+                        pass
+                for lock in reversed(acquired):
+                    lock.release()
+                for file, _, _, _, _, _, _, _ in targets_to_download:
+                    try:
+                        GLib.idle_add(lambda f=file: (f.invalidate_extension_info(), False)[1])
+                    except Exception:
+                        pass
+                _notify("OneDrive", "La caché está ocupada por otra operación.", "dialog-warning")
+                return
+
             downloaded = 0
+            already_cached = 0
+            failed = 0
             affected_mounts = set()
             buf = bytearray(1024 * 1024)
             mv = memoryview(buf)
@@ -540,6 +621,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                                 cid_f = path_to_id.get(rel_f)
                                 # Avoid redundant disk I/O if file is already in cache
                                 if cid_f and cid_f in cached_ids:
+                                    already_cached += 1
                                     continue
 
                                 with self._sync_lock:
@@ -550,12 +632,13 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                                             pass
                                     downloaded += 1
                                 except Exception:
-                                    pass
+                                    failed += 1
                                 finally:
                                     with self._sync_lock:
                                         self.syncing_paths.discard(fp)
                     else:
                         if item_id and item_id in cached_ids:
+                            already_cached += 1
                             continue
 
                         with self._sync_lock:
@@ -566,7 +649,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                                     pass
                             downloaded += 1
                         except Exception:
-                            pass
+                            failed += 1
                         finally:
                             with self._sync_lock:
                                 self.syncing_paths.discard(file_path)
@@ -595,8 +678,12 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                 for lock in reversed(acquired):
                     lock.release()
 
-                if downloaded > 0:
+                if downloaded > 0 and failed == 0:
                     _notify("OneDrive: Descarga completada", f"Se descargaron {downloaded} archivo(s) para uso sin conexión.", "onedrive-custom-synced")
+                elif downloaded > 0 and failed > 0:
+                    _notify("OneDrive: Descarga parcial", f"Se descargaron {downloaded} archivo(s), pero fallaron {failed}.", "dialog-warning")
+                elif failed > 0:
+                    _notify("OneDrive: Error de descarga", f"Falló la descarga de {failed} archivo(s). Verifique la conexión o el estado de OneDrive.", "dialog-error")
                 else:
                     _notify("OneDrive", "Todos los archivos seleccionados ya estaban descargados en este equipo.", "onedrive-custom-synced")
 

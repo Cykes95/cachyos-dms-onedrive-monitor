@@ -8,6 +8,7 @@ import os
 import sys
 import subprocess
 import fcntl
+import time
 
 raw_paths = os.environ.get("NAUTILUS_SCRIPT_SELECTED_FILE_PATHS", "")
 selected_paths = [p for p in raw_paths.splitlines() if p]
@@ -110,6 +111,7 @@ def get_db_items(db_path):
 freed_count = 0
 
 locks = {}
+lock_failed = False
 try:
     for target in selected_paths:
         if not target:
@@ -136,7 +138,21 @@ try:
         if cache_dir not in locks:
             try:
                 lf = open(os.path.join(cache_dir, ".lock"), "w")
-                fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+                locked = False
+                for _ in range(5):
+                    try:
+                        fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        locked = True
+                        break
+                    except (BlockingIOError, OSError):
+                        time.sleep(0.2)
+                if not locked:
+                    try:
+                        lf.close()
+                    except Exception:
+                        pass
+                    lock_failed = True
+                    break
                 locks[cache_dir] = lf
             except Exception:
                 pass
@@ -172,6 +188,13 @@ finally:
             lf.close()
         except Exception:
             pass
+
+if lock_failed:
+    try:
+        subprocess.run(["notify-send", "-a", "OneDrive", "-i", "dialog-warning", "Espacio liberado", "La caché está ocupada por otra operación."])
+    except Exception:
+        pass
+    sys.exit(1)
 
 if freed_count > 0:
     msg = f"Se ha liberado el espacio local de {freed_count} archivo(s)."

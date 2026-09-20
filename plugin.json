@@ -10,7 +10,6 @@
   "settings": "./Settings.qml",
   "icon": "cloud_sync",
   "requires_dms": ">=1.6.0",
-  "requires": ["onedriver"],
-  "dependencies": ["onedriver", "systemctl", "journalctl", "findmnt", "xdg-open", "timeout"],
+  "dependencies": ["onedriver", "systemctl", "journalctl", "findmnt", "xdg-open", "timeout", "flock", "realpath"],
   "permissions": ["settings_read", "settings_write", "process"]
 }

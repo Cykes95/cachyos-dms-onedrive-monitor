@@ -122,8 +122,10 @@ shift 1 2>/dev/null || true
 case "$cmd" in
     start)
         [ -n "$1" ] || { echo "Error: falta el identificador o nombre de unidad" >&2; exit 1; }
+        encoded=$(normalize_encoded "$1")
+        validate_encoded "$encoded"
         ensure_systemd_override
-        unit=$(normalize_unit "$1")
+        unit="onedriver@${encoded}.service"
         if out=$(systemctl --user start "$unit" 2>&1); then
             echo "started $unit"
             exit 0
@@ -134,8 +136,18 @@ case "$cmd" in
         ;;
     stop)
         [ -n "$1" ] || { echo "Error: falta el identificador o nombre de unidad" >&2; exit 1; }
-        unit=$(normalize_unit "$1")
+        encoded=$(normalize_encoded "$1")
+        validate_encoded "$encoded"
+        unit="onedriver@${encoded}.service"
+        mountpoint=$(systemd-escape --unescape --path "$encoded" 2>/dev/null || true)
         if out=$(systemctl --user stop "$unit" 2>&1); then
+            if ! wait_unit_stopped "$unit"; then
+                echo "Advertencia: $unit no terminó de detenerse en el tiempo esperado" >&2
+            fi
+            if [ -n "$mountpoint" ] && is_mounted "$mountpoint"; then
+                fusermount_bin=$(command -v fusermount3 || command -v fusermount || true)
+                [ -n "$fusermount_bin" ] && "$fusermount_bin" -uz "$mountpoint" 2>/dev/null || true
+            fi
             echo "stopped $unit"
             exit 0
         else
@@ -145,8 +157,10 @@ case "$cmd" in
         ;;
     restart)
         [ -n "$1" ] || { echo "Error: falta el identificador o nombre de unidad" >&2; exit 1; }
+        encoded=$(normalize_encoded "$1")
+        validate_encoded "$encoded"
         ensure_systemd_override
-        unit=$(normalize_unit "$1")
+        unit="onedriver@${encoded}.service"
         if out=$(systemctl --user restart "$unit" 2>&1); then
             echo "restarted $unit"
             exit 0
@@ -157,7 +171,9 @@ case "$cmd" in
         ;;
     enable)
         [ -n "$1" ] || { echo "Error: falta el identificador o nombre de unidad" >&2; exit 1; }
-        unit=$(normalize_unit "$1")
+        encoded=$(normalize_encoded "$1")
+        validate_encoded "$encoded"
+        unit="onedriver@${encoded}.service"
         if out=$(systemctl --user enable "$unit" 2>&1); then
             echo "enabled $unit"
             exit 0
@@ -168,7 +184,9 @@ case "$cmd" in
         ;;
     disable)
         [ -n "$1" ] || { echo "Error: falta el identificador o nombre de unidad" >&2; exit 1; }
-        unit=$(normalize_unit "$1")
+        encoded=$(normalize_encoded "$1")
+        validate_encoded "$encoded"
+        unit="onedriver@${encoded}.service"
         if out=$(systemctl --user disable "$unit" 2>&1); then
             echo "disabled $unit"
             exit 0
@@ -179,7 +197,9 @@ case "$cmd" in
         ;;
     toggle-autostart)
         [ -n "$1" ] || { echo "Error: falta el identificador o nombre de unidad" >&2; exit 1; }
-        unit=$(normalize_unit "$1")
+        encoded=$(normalize_encoded "$1")
+        validate_encoded "$encoded"
+        unit="onedriver@${encoded}.service"
         state=$(systemctl --user is-enabled "$unit" 2>/dev/null || true)
         case "$state" in
             enabled*)
@@ -299,6 +319,18 @@ case "$cmd" in
             echo "Error: el punto de montaje $mountpoint sigue ocupado; no se puede vaciar la caché con seguridad" >&2
             exit 1
         fi
+
+        # Sincronizar bloqueo con la extensión de Nautilus
+        lock_file="$cache_dir/$encoded/.lock"
+        if command -v flock >/dev/null 2>&1 && [ -d "$cache_dir/$encoded" ]; then
+            exec 9>"$lock_file" 2>/dev/null || true
+            if ! flock -x -w 5 9 2>/dev/null; then
+                echo "Error: la caché está ocupada por otra operación (Nautilus)" >&2
+                exec 9>&- 2>/dev/null || true
+                exit 1
+            fi
+        fi
+
         content_dir="$cache_dir/$encoded/content"
         if [ -d "$content_dir" ]; then
             chmod -R u+w "$content_dir" 2>/dev/null || true
@@ -310,6 +342,19 @@ case "$cmd" in
         rm -f "$cache_dir/$encoded/onedriver.db"* 2>/dev/null || true
         # Reset all cached files so monitor immediately recalculates
         rm -f "$runtime_dir"/*_"${encoded}.tmp" /tmp/onedriver_*_"${encoded}.tmp" 2>/dev/null || true
+
+        # Liberar bloqueo tras purgar
+        if command -v flock >/dev/null 2>&1 && [ -d "$cache_dir/$encoded" ]; then
+            flock -u 9 2>/dev/null || true
+            exec 9>&- 2>/dev/null || true
+        fi
+
+        # Comprobar que onedriver.db realmente desapareció
+        if [ -f "$cache_dir/$encoded/onedriver.db" ]; then
+            echo "Error: no se pudo eliminar la base de datos onedriver.db" >&2
+            exit 1
+        fi
+
         if [ "$was_active" -eq 1 ]; then
             systemctl --user reset-failed "$unit" 2>/dev/null || true
             if ! out=$(systemctl --user start "$unit" 2>&1); then
@@ -339,6 +384,20 @@ case "$cmd" in
             echo "Error: el punto de montaje $mountpoint sigue ocupado; no se puede desvincular" >&2
             exit 1
         fi
+
+        # Sincronizar bloqueo con Nautilus antes de desvincular
+        lock_file="$cache_dir/$encoded/.lock"
+        if command -v flock >/dev/null 2>&1 && [ -d "$cache_dir/$encoded" ]; then
+            exec 9>"$lock_file" 2>/dev/null || true
+            if ! flock -x -w 5 9 2>/dev/null; then
+                echo "Error: la cuenta está ocupada por otra operación (Nautilus)" >&2
+                exec 9>&- 2>/dev/null || true
+                exit 1
+            fi
+            flock -u 9 2>/dev/null || true
+            exec 9>&- 2>/dev/null || true
+        fi
+
         if ! systemctl --user disable "$unit" 2>/dev/null; then
             echo "Advertencia: no se pudo deshabilitar inicio automático de $unit" >&2
         fi
@@ -347,6 +406,13 @@ case "$cmd" in
         systemctl --user daemon-reload 2>/dev/null || true
         rm -rf "$cache_dir/$encoded" 2>/dev/null || true
         rm -f "$runtime_dir"/*_"${encoded}.tmp" /tmp/onedriver_*_"${encoded}.tmp" 2>/dev/null || true
+
+        # Comprobar que el directorio de cuenta realmente desapareció
+        if [ -d "$cache_dir/$encoded" ]; then
+            echo "Error: no se pudo eliminar el directorio de cuenta $cache_dir/$encoded" >&2
+            exit 1
+        fi
+
         echo "removed mount $encoded"
         exit 0
         ;;
@@ -423,8 +489,14 @@ case "$cmd" in
 
         case "$1" in
             --restart|-r)
+                was_running=0
                 if pgrep -x nautilus >/dev/null 2>&1; then
+                    was_running=1
                     nautilus -q 2>/dev/null || true
+                    sleep 0.5
+                fi
+                if [ "$was_running" -eq 1 ]; then
+                    nautilus >/dev/null 2>&1 &
                 fi
                 ;;
         esac

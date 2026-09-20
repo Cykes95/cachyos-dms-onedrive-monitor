@@ -10,6 +10,7 @@ import subprocess
 import mmap
 import re
 import fcntl
+import time
 
 raw_paths = os.environ.get("NAUTILUS_SCRIPT_SELECTED_FILE_PATHS", "")
 selected_paths = [p for p in raw_paths.splitlines() if p]
@@ -114,9 +115,12 @@ pruned_paths = [
 ]
 
 downloaded_count = 0
+already_cached_count = 0
+failed_count = 0
 buf = bytearray(1024 * 1024)
 mv = memoryview(buf)
 locks = {}
+lock_failed = False
 
 try:
     for target in pruned_paths:
@@ -144,7 +148,21 @@ try:
         if cache_dir not in locks:
             try:
                 lf = open(os.path.join(cache_dir, ".lock"), "w")
-                fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+                locked = False
+                for _ in range(5):
+                    try:
+                        fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        locked = True
+                        break
+                    except (BlockingIOError, OSError):
+                        time.sleep(0.2)
+                if not locked:
+                    try:
+                        lf.close()
+                    except Exception:
+                        pass
+                    lock_failed = True
+                    break
                 locks[cache_dir] = lf
             except Exception:
                 pass
@@ -166,6 +184,7 @@ try:
                     rel_f = os.path.relpath(fp, matched_mp)
                     cid = path_to_id.get(rel_f)
                     if cid and cid in cached_ids:
+                        already_cached_count += 1
                         continue
                     try:
                         with open(fp, "rb") as f:
@@ -173,11 +192,12 @@ try:
                                 pass
                         downloaded_count += 1
                     except Exception:
-                        pass
+                        failed_count += 1
         else:
             rel_f = os.path.relpath(target, matched_mp)
             cid = path_to_id.get(rel_f)
             if cid and cid in cached_ids:
+                already_cached_count += 1
                 continue
             try:
                 with open(target, "rb") as f:
@@ -185,7 +205,7 @@ try:
                         pass
                 downloaded_count += 1
             except Exception:
-                pass
+                failed_count += 1
 finally:
     for lf in locks.values():
         try:
@@ -194,12 +214,27 @@ finally:
         except Exception:
             pass
 
-if downloaded_count > 0:
+if lock_failed:
+    try:
+        subprocess.run(["notify-send", "-a", "OneDrive", "-i", "dialog-warning", "Descarga de OneDrive", "La caché está ocupada por otra operación."])
+    except Exception:
+        pass
+    sys.exit(1)
+
+if downloaded_count > 0 and failed_count == 0:
     msg = f"Se descargaron {downloaded_count} archivo(s) para uso sin conexión."
+    icon = "onedrive-custom-synced"
+elif downloaded_count > 0 and failed_count > 0:
+    msg = f"Se descargaron {downloaded_count} archivo(s), pero fallaron {failed_count}."
+    icon = "dialog-warning"
+elif failed_count > 0:
+    msg = f"Falló la descarga de {failed_count} archivo(s). Verifique la conexión o el estado de OneDrive."
+    icon = "dialog-error"
 else:
     msg = "Los archivos seleccionados ya estaban descargados en este equipo."
+    icon = "onedrive-custom-synced"
 
 try:
-    subprocess.run(["notify-send", "-a", "OneDrive", "-i", "onedrive-custom-synced", "Descarga de OneDrive", msg])
+    subprocess.run(["notify-send", "-a", "OneDrive", "-i", icon, "Descarga de OneDrive", msg])
 except Exception:
     pass

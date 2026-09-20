@@ -20,6 +20,7 @@ PluginComponent {
     property var pendingUnits: ({})
     property string pendingBatch: ""
     property bool popoutVisible: false
+    property string pendingOpenMount: ""
 
     readonly property string pluginPath: String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "").replace(/\/+$/, "")
     readonly property string monitorPath: pluginPath + "/monitor.sh"
@@ -81,6 +82,9 @@ PluginComponent {
         let t = String(rawText).replace(/[\r\n]+/g, " ").replace(/\s+/g, " ").trim();
         if (/Configuration file not found|using defaults|Unimplemented opcode|exit-code|signal=TERMINATED/i.test(t))
             return "";
+
+        if (/activityLimitReached|HTTP 429|throttled/i.test(t))
+            return "Límite temporal de API de Microsoft (HTTP 429)";
 
         // Check for download completed
         let m = t.match(/Download completed!.*?name="([^"]+)"/i) || t.match(/Download completed!.*?name=([^\s]+)/i);
@@ -146,6 +150,8 @@ PluginComponent {
             return "idle";
 
         const activity = raw.toLowerCase();
+        if (/activitylimitreached|http 429|throttled/.test(activity))
+            return "warning";
         if (/failed to unmount/i.test(activity))
             return "error";
         if (/^(\d\d:\d\d:\d\d\s+)?err\b/.test(activity))
@@ -167,6 +173,7 @@ PluginComponent {
         case "upload": return "cloud_upload";
         case "download": return "cloud_download";
         case "completed": return "cloud_done";
+        case "warning": return "sync_problem";
         case "offline": return "cloud_off";
         case "error": return "error_outline";
         default:
@@ -183,6 +190,7 @@ PluginComponent {
         case "upload":
         case "download": return Theme.primary;
         case "completed": return Theme.success;
+        case "warning": return Theme.warning;
         case "offline": return Theme.warning;
         case "error": return Theme.error;
         default: return mount && mount.active === "active" && mount.mounted === "1" ? Theme.success : Theme.surfaceVariantText;
@@ -403,10 +411,13 @@ PluginComponent {
 
     function openMount(mount) {
         if (!mount || !mount.path) return;
-        if (mount.active !== "active" || mount.mounted !== "1") {
-            runAction(mount, "start");
+        if (mount.active === "active" && mount.mounted === "1") {
+            Quickshell.execDetached(["xdg-open", mount.path]);
+            return;
         }
-        Quickshell.execDetached(["xdg-open", mount.path]);
+        root.pendingOpenMount = mount.encoded;
+        runAction(mount, "start");
+        ToastService.showInfo("OneDrive", "Montando " + root.displayLabel(mount) + " antes de abrir la carpeta…");
     }
 
     function parseStatus(output) {
@@ -452,12 +463,25 @@ PluginComponent {
         mounts = result;
         hasInitialSnapshot = true;
         lastRefresh = Qt.formatTime(new Date(), "hh:mm:ss");
+
+        if (root.pendingOpenMount) {
+            const m = result.find(item => item.encoded === root.pendingOpenMount);
+            if (m && m.active === "active" && m.mounted === "1") {
+                root.pendingOpenMount = "";
+                Quickshell.execDetached(["xdg-open", m.path]);
+            }
+        }
     }
 
     Component.onCompleted: {
+        _nautilusInitDone = true;
         refresh();
-        if (enableNautilus && actionsPath) {
-            Quickshell.execDetached(["sh", actionsPath, "install-nautilus"]);
+        if (actionsPath) {
+            if (enableNautilus) {
+                Quickshell.execDetached(["sh", actionsPath, "install-nautilus"]);
+            } else {
+                Quickshell.execDetached(["sh", actionsPath, "uninstall-nautilus"]);
+            }
         }
     }
 
@@ -709,10 +733,13 @@ PluginComponent {
     }
 
     verticalBarPill: Component {
-        Column {
-            spacing: (root.showBarText && !!root.barText) ? Theme.spacingXS : 0
+        Item {
+            implicitWidth: root.iconSize
+            implicitHeight: root.iconSize
+            anchors.horizontalCenter: parent.horizontalCenter
 
             DankIcon {
+                anchors.centerIn: parent
                 name: {
                     if (root.hasProblem) return "sync_problem";
                     if (root.transferCount > 0) return "cloud_sync";
@@ -726,16 +753,6 @@ PluginComponent {
                     if (root.activeCount > 0) return Theme.widgetIconColor;
                     return Theme.surfaceVariantText;
                 }
-                anchors.horizontalCenter: parent.horizontalCenter
-            }
-
-            StyledText {
-                visible: root.showBarText && !!root.barText
-                text: root.barText
-                color: Theme.surfaceText
-                font.pixelSize: Theme.fontSizeSmall
-                rotation: 90
-                anchors.horizontalCenter: parent.horizontalCenter
             }
         }
     }
