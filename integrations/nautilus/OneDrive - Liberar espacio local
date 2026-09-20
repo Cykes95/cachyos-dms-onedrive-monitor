@@ -7,6 +7,7 @@ Permite seleccionar uno o varios archivos/carpetas en Nautilus y liberar su espa
 import os
 import sys
 import subprocess
+import fcntl
 
 raw_paths = os.environ.get("NAUTILUS_SCRIPT_SELECTED_FILE_PATHS", "")
 selected_paths = [p for p in raw_paths.splitlines() if p]
@@ -108,51 +109,69 @@ def get_db_items(db_path):
 
 freed_count = 0
 
-for target in selected_paths:
-    if not target:
-        continue
+locks = {}
+try:
+    for target in selected_paths:
+        if not target:
+            continue
 
-    # Find matching mount (longest mountpoint first)
-    matched_mp = None
-    matched_info = None
-    for mp in sorted(mounts.keys(), key=len, reverse=True):
-        if target == mp or target.startswith(mp + "/"):
-            matched_mp = mp
-            matched_info = mounts[mp]
-            break
+        # Find matching mount (longest mountpoint first)
+        matched_mp = None
+        matched_info = None
+        for mp in sorted(mounts.keys(), key=len, reverse=True):
+            if target == mp or target.startswith(mp + "/"):
+                matched_mp = mp
+                matched_info = mounts[mp]
+                break
 
-    if not matched_mp:
-        continue
+        if not matched_mp:
+            continue
 
-    content_dir = matched_info["content_dir"]
-    db_path = matched_info["db_path"]
-    if not os.path.isdir(content_dir) or not os.path.isfile(db_path):
-        continue
+        content_dir = matched_info["content_dir"]
+        db_path = matched_info["db_path"]
+        cache_dir = matched_info["cache_dir"]
+        if not os.path.isdir(content_dir) or not os.path.isfile(db_path):
+            continue
 
-    rel_path = os.path.relpath(target, matched_mp)
-    is_root = (rel_path == ".")
-    is_dir = is_root or os.path.isdir(target)
-    target_prefix = "" if is_root else (rel_path + "/")
+        if cache_dir not in locks:
+            try:
+                lf = open(os.path.join(cache_dir, ".lock"), "w")
+                fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+                locks[cache_dir] = lf
+            except Exception:
+                pass
 
-    db_items = get_db_items(db_path)
+        rel_path = os.path.relpath(target, matched_mp)
+        is_root = (rel_path == ".")
+        is_dir = is_root or os.path.isdir(target)
+        target_prefix = "" if is_root else (rel_path + "/")
 
-    for item_id, item_rel in db_items:
-        should_free = False
-        if is_root:
-            should_free = True
-        elif is_dir and item_rel.startswith(target_prefix):
-            should_free = True
-        elif not is_dir and item_rel == rel_path:
-            should_free = True
+        db_items = get_db_items(db_path)
 
-        if should_free:
-            cached_file = os.path.join(content_dir, item_id)
-            if os.path.isfile(cached_file):
-                try:
-                    os.remove(cached_file)
-                    freed_count += 1
-                except Exception:
-                    pass
+        for item_id, item_rel in db_items:
+            should_free = False
+            if is_root:
+                should_free = True
+            elif is_dir and item_rel.startswith(target_prefix):
+                should_free = True
+            elif not is_dir and item_rel == rel_path:
+                should_free = True
+
+            if should_free:
+                cached_file = os.path.join(content_dir, item_id)
+                if os.path.isfile(cached_file):
+                    try:
+                        os.remove(cached_file)
+                        freed_count += 1
+                    except Exception:
+                        pass
+finally:
+    for lf in locks.values():
+        try:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+            lf.close()
+        except Exception:
+            pass
 
 if freed_count > 0:
     msg = f"Se ha liberado el espacio local de {freed_count} archivo(s)."

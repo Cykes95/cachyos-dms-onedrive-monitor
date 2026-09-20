@@ -1,4 +1,5 @@
 #!/bin/sh
+umask 077
 
 # Read-only discovery helper for the OneDrive Monitor DMS plugin.
 # Highly optimized: single-pass systemd status, cached quota & size lookups, zero disk churn.
@@ -132,20 +133,26 @@ emit_mount() {
     active="inactive"
     sub_state="dead"
     enabled="disabled"
-    while IFS='=' read -r k v; do
-        case "$k" in
-            ActiveState) active="$v" ;;
-            SubState) sub_state="$v" ;;
-            UnitFileState)
-                case "$v" in
-                    enabled*) enabled="enabled" ;;
-                    *) enabled="disabled" ;;
-                esac
-                ;;
-        esac
-    done <<PROP_EOF
-$(systemctl --user show "$unit" --property=ActiveState,SubState,UnitFileState 2>/dev/null)
+    props=$(systemctl --user show "$unit" --property=ActiveState,SubState,UnitFileState 2>/dev/null)
+    sc_ret=$?
+    if [ "$sc_ret" -ne 0 ] || [ -z "$props" ]; then
+        sub_state="systemd_error"
+    else
+        while IFS='=' read -r k v; do
+            case "$k" in
+                ActiveState) active="$v" ;;
+                SubState) sub_state="$v" ;;
+                UnitFileState)
+                    case "$v" in
+                        enabled*) enabled="enabled" ;;
+                        *) enabled="disabled" ;;
+                    esac
+                    ;;
+            esac
+        done <<PROP_EOF
+$props
 PROP_EOF
+    fi
 
     mounted=0
     if command -v findmnt >/dev/null 2>&1; then
@@ -176,8 +183,8 @@ PROP_EOF
         if [ -r "$cache_size_file" ]; then
             read -r last_ts last_mtime last_db_sz cached_val < "$cache_size_file" 2>/dev/null || true
             if [ -n "$last_ts" ] && [ -n "$cached_val" ]; then
-                # Mandatory TTL ceiling: must recalculate after 300s regardless of mtime
-                if [ "$((now - last_ts))" -lt 300 ]; then
+                # Mandatory TTL ceiling: must recalculate after 120s regardless of mtime
+                if [ "$((now - last_ts))" -lt 120 ]; then
                     if [ "$((now - last_ts))" -lt 30 ] || { [ "$last_mtime" = "$cur_mtime" ] && [ "$last_db_sz" = "$cur_db_sz" ]; }; then
                         cache_bytes="$cached_val"
                         need_du=0
@@ -241,8 +248,8 @@ Q_EOF
 
     # Optimization: Cache journalctl activity for 10s when active
     activity=""
+    act_cache_file="$runtime_dir/act_${encoded}.tmp"
     if [ "$active" = "active" ]; then
-        act_cache_file="$runtime_dir/act_${encoded}.tmp"
         read_act=1
         if [ -r "$act_cache_file" ]; then
             read -r last_act_ts last_act < "$act_cache_file" 2>/dev/null || true
@@ -260,6 +267,8 @@ Q_EOF
                 | sed 's/[[:space:]][[:space:]]*/ /g')
             write_atomic "$act_cache_file" "$now $activity"
         fi
+    else
+        rm -f "$act_cache_file" 2>/dev/null || true
     fi
 
     # Clean any accidental tabs/newlines in text fields

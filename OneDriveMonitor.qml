@@ -54,9 +54,13 @@ PluginComponent {
         return mounts.filter(mount => mount.active === "active" || mount.mounted === "1");
     }
 
+    function isMountDegraded(mount) {
+        return Boolean(mount && mount.active === "active" && mount.mounted !== "1");
+    }
+
     readonly property int activeCount: mounts.filter(mount => mount.active === "active" && mount.mounted === "1").length
     readonly property int transferCount: mounts.filter(mount => activityKind(mount) === "upload" || activityKind(mount) === "download").length
-    readonly property bool hasProblem: mounts.some(mount => mount.active === "failed" || activityKind(mount) === "error" || activityKind(mount) === "offline")
+    readonly property bool hasProblem: mounts.some(mount => mount.active === "failed" || isMountDegraded(mount) || activityKind(mount) === "error" || activityKind(mount) === "offline")
     readonly property bool allActive: mounts.length > 0 && activeCount === mounts.length
 
     readonly property string summary: {
@@ -99,6 +103,7 @@ PluginComponent {
     }
 
     function activityIcon(mount) {
+        if (isMountDegraded(mount)) return "cloud_alert";
         switch (activityKind(mount)) {
         case "upload": return "cloud_upload";
         case "download": return "cloud_download";
@@ -114,6 +119,7 @@ PluginComponent {
     }
 
     function activityColor(mount) {
+        if (isMountDegraded(mount)) return Theme.warning;
         switch (activityKind(mount)) {
         case "upload":
         case "download": return Theme.primary;
@@ -136,9 +142,12 @@ PluginComponent {
             return "Procesando…";
         }
 
-        const kind = activityKind(mount);
+        if (isMountDegraded(mount))
+            return "Servicio activo · Montaje no disponible (requiere reinicio)";
         if (mount.active === "failed")
             return "Servicio con errores";
+        if (mount.subState === "systemd_error")
+            return "Error al comunicar con systemd";
         if (kind === "offline")
             return "Sin conexión · solo lectura";
         if (mount.active === "active" && mount.mounted === "1") {
@@ -273,7 +282,7 @@ PluginComponent {
 
         actionProcess.verb = verb;
         actionProcess.target = mount.encoded;
-        actionProcess.command = ["sh", actionsPath, verb, mount.encoded];
+        actionProcess.command = ["timeout", "30s", "sh", actionsPath, verb, mount.encoded];
         actionProcess.running = true;
     }
 
@@ -283,7 +292,7 @@ PluginComponent {
         root.pendingBatch = verb;
         actionProcess.verb = verb;
         actionProcess.target = "";
-        actionProcess.command = ["sh", actionsPath, verb];
+        actionProcess.command = ["timeout", "30s", "sh", actionsPath, verb];
         actionProcess.running = true;
     }
 
@@ -339,6 +348,7 @@ PluginComponent {
         const result = [];
         const previous = mounts.slice();
         const lines = (output || "").trim().split("\n");
+        const nonEmptyLines = lines.filter(l => l.trim().length > 0);
         for (const line of lines) {
             if (!line.trim())
                 continue;
@@ -362,6 +372,10 @@ PluginComponent {
                 accountType: fields[13] || "work",
                 cachedFilesCount: Number(fields[14] || 0)
             });
+        }
+        if (nonEmptyLines.length > 0 && result.length === 0) {
+            root.lastError = "Salida del monitor incompleta o no válida (" + nonEmptyLines.length + " líneas descartadas)";
+            return;
         }
         if (result.length === 0 && mounts.length > 0) {
             // Transient empty output (e.g. systemd reloading): retain previous snapshot
@@ -403,6 +417,7 @@ PluginComponent {
         repeat: false
         onTriggered: {
             if (root.refreshInFlight) {
+                monitorProcess.running = false;
                 root.refreshInFlight = false;
                 root.pendingBatch = "";
                 root.pendingUnits = ({});
@@ -430,6 +445,9 @@ PluginComponent {
             if (exitCode === 0) {
                 root.lastError = "";
                 root.parseStatus(monitorOutput.text);
+            } else if (exitCode === 124) {
+                root.pendingUnits = ({});
+                root.lastError = "Tiempo de espera agotado (7s) al consultar onedriver";
             } else {
                 root.pendingUnits = ({});
                 root.lastError = (monitorError.text || "No se pudo consultar onedriver").trim().split("\n")[0];
@@ -456,7 +474,11 @@ PluginComponent {
                 root.pendingUnits = ({});
             }
 
-            if (exitCode !== 0) {
+            if (exitCode === 124) {
+                root.pendingUnits = ({});
+                root.lastActionError = "Tiempo de espera agotado (30s) al ejecutar '" + actionProcess.verb + "'";
+                ToastService.showError("OneDrive", "Tiempo de espera agotado al ejecutar " + actionProcess.verb);
+            } else if (exitCode !== 0) {
                 root.pendingUnits = ({});
                 const message = (actionError.text || actionOutput.text || "").trim().split("\n")[0];
                 root.lastActionError = "Fallo en acción '" + actionProcess.verb + "': " + (message || ("código " + exitCode));
@@ -933,9 +955,9 @@ PluginComponent {
                                                 spacing: Theme.spacingS
 
                                                 DankButton {
-                                                    text: mount.active === "active" ? "Desmontar" : "Montar"
+                                                    text: root.isMountDegraded(mount) ? "Reiniciar" : (mount.active === "active" ? "Desmontar" : "Montar")
                                                     enabled: !cardItem.isBusy
-                                                    onClicked: root.toggleMount(mount)
+                                                    onClicked: root.isMountDegraded(mount) ? root.runAction(mount, "restart") : root.toggleMount(mount)
                                                 }
 
                                                 DankActionButton {

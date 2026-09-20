@@ -40,7 +40,7 @@ A native, lightweight monitor and manager for Microsoft OneDrive mounts on Linux
 
 - **Ajustes Modernos (`Settings.qml`)**:
   - Estructurado con tarjetas nativas `SettingsCard` de DMS.
-  - Configuración del intervalo de sondeo (2s a 60s), visualización de caché/cuota y montajes detenidos.
+  - Configuración del intervalo de sondeo (2s a 30s), visualización de caché/cuota y montajes detenidos.
   - Interruptor para habilitar/deshabilitar la integración con Nautilus.
   - Control de notificaciones emergentes de estado.
   - Atajos para abrir el gestor de cuentas o el directorio de caché personalizado.
@@ -69,6 +69,5 @@ dms restart
 ```
 O recarga en caliente de plugins:
 ```bash
-dms ipc plugin-scan rescan onedriverMonitor
-dms ipc plugins reload
+dms ipc plugins reload onedriverMonitor
 ```

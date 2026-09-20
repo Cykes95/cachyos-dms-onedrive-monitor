@@ -1,4 +1,5 @@
 #!/bin/sh
+umask 077
 
 # Action helper for OneDrive Monitor DMS plugin
 # Manages systemd units, caching, and onedriver lifecycle
@@ -69,7 +70,7 @@ wait_unit_stopped() {
     for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
         st=$(systemctl --user is-active "$u" 2>/dev/null || true)
         case "$st" in
-            inactive|dead|failed|unknown) return 0 ;;
+            inactive|dead|failed) return 0 ;;
             *) sleep 0.2 ;;
         esac
     done
@@ -79,22 +80,38 @@ wait_unit_stopped() {
 validate_encoded() {
     val="$1"
     case "$val" in
-        */*|*..*|''|*[[:space:]]*)
+        .|..|*/*|*..*|''|*[[:space:]]*)
             echo "Error: identificador de cuenta no válido: $val" >&2
             exit 1
             ;;
     esac
+    target_dir="$cache_dir/$val"
+    real_cache=$(realpath -m "$cache_dir" 2>/dev/null || realpath "$cache_dir" 2>/dev/null || echo "$cache_dir")
+    real_target=$(realpath -m "$target_dir" 2>/dev/null || realpath "$target_dir" 2>/dev/null || echo "$target_dir")
+    case "$real_target" in
+        "$real_cache"/*) ;;
+        *)
+            echo "Error: ruta de cuenta fuera del directorio de caché: $val" >&2
+            exit 1
+            ;;
+    esac
+    if [ "$real_target" = "$real_cache" ] || [ "$real_target" = "/" ] || [ -z "$val" ]; then
+        echo "Error: ruta de cuenta insegura o no permitida: $val" >&2
+        exit 1
+    fi
 }
 
 ensure_systemd_override() {
     fusermount_bin=$(command -v fusermount3 || command -v fusermount || echo /usr/bin/fusermount3)
     systemd_override_dir="${XDG_CONFIG_HOME:-$home_dir/.config}/systemd/user/onedriver@.service.d"
     override_file="$systemd_override_dir/onedriver-monitor.conf"
-    # Remove legacy override.conf if created previously by older plugin versions
-    [ -f "$systemd_override_dir/override.conf" ] && rm -f "$systemd_override_dir/override.conf" 2>/dev/null || true
+    # Only remove legacy override.conf if it was created by DMS OneDriveMonitor
+    if [ -f "$systemd_override_dir/override.conf" ] && grep -Fqs "Created by DMS OneDriveMonitor" "$systemd_override_dir/override.conf"; then
+        rm -f "$systemd_override_dir/override.conf" 2>/dev/null || true
+    fi
     if [ ! -f "$override_file" ]; then
         mkdir -p "$systemd_override_dir" 2>/dev/null || true
-        printf '[Service]\nExecStopPost=\nExecStopPost=-%s -uz /%%I\n' "$fusermount_bin" > "$override_file" 2>/dev/null || true
+        printf '# Created by DMS OneDriveMonitor\n[Service]\nExecStopPost=\nExecStopPost=-%s -uz /%%I\n' "$fusermount_bin" > "$override_file" 2>/dev/null || true
         systemctl --user daemon-reload 2>/dev/null || true
     fi
 }
@@ -228,6 +245,22 @@ case "$cmd" in
                 failed=1
                 failed_units="$failed_units $u"
             fi
+            if ! wait_unit_stopped "$u"; then
+                failed=1
+                failed_units="$failed_units $u"
+            fi
+            enc=${u#onedriver@}
+            enc=${enc%.service}
+            mp=$(systemd-escape --unescape --path "$enc" 2>/dev/null || true)
+            if [ -n "$mp" ] && is_mounted "$mp"; then
+                fusermount_bin=$(command -v fusermount3 || command -v fusermount || true)
+                [ -n "$fusermount_bin" ] && "$fusermount_bin" -uz "$mp" 2>/dev/null || true
+                sleep 0.2
+                if is_mounted "$mp"; then
+                    failed=1
+                    failed_units="$failed_units $u(fuse_busy)"
+                fi
+            fi
         done
         if [ "$failed" -eq 1 ]; then
             echo "Error al desmontar unidades:$failed_units" >&2
@@ -257,9 +290,18 @@ case "$cmd" in
         content_dir="$cache_dir/$encoded/content"
         if [ -d "$content_dir" ]; then
             find "$content_dir" -mindepth 1 -delete 2>/dev/null || rm -rf "$content_dir"/* 2>/dev/null || true
+            rem=$(find "$content_dir" -mindepth 1 2>/dev/null | head -n 1)
+            if [ -n "$rem" ]; then
+                echo "Error: no se pudieron eliminar todos los archivos de la caché: $content_dir" >&2
+                exit 1
+            fi
         fi
         # Remove onedriver.db to compact metadata and reset cache size completely
         rm -f "$cache_dir/$encoded/onedriver.db" 2>/dev/null || true
+        if [ -f "$cache_dir/$encoded/onedriver.db" ]; then
+            echo "Error: no se pudo eliminar la base de datos de metadatos de caché" >&2
+            exit 1
+        fi
         # Reset all cached files so monitor immediately recalculates
         rm -f "$runtime_dir"/*_"${encoded}.tmp" /tmp/onedriver_*_"${encoded}.tmp" 2>/dev/null || true
         if [ "$was_active" -eq 1 ]; then
@@ -391,10 +433,11 @@ case "$cmd" in
 
         rm -f "$ext_dir/onedrive_extension.py" 2>/dev/null || true
         rm -f "$scripts_dir/OneDrive - Liberar espacio local" "$scripts_dir/OneDrive - Descargar en este equipo" 2>/dev/null || true
-        if [ -f "$systemd_override_dir/onedriver-monitor.conf" ] || [ -f "$systemd_override_dir/override.conf" ]; then
-            rm -f "$systemd_override_dir/onedriver-monitor.conf" "$systemd_override_dir/override.conf" 2>/dev/null || true
-            systemctl --user daemon-reload 2>/dev/null || true
+        rm -f "$systemd_override_dir/onedriver-monitor.conf" 2>/dev/null || true
+        if [ -f "$systemd_override_dir/override.conf" ] && grep -Fqs "Created by DMS OneDriveMonitor" "$systemd_override_dir/override.conf"; then
+            rm -f "$systemd_override_dir/override.conf" 2>/dev/null || true
         fi
+        systemctl --user daemon-reload 2>/dev/null || true
         if pgrep -x nautilus >/dev/null 2>&1; then
             nautilus -q 2>/dev/null || true
         fi

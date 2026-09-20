@@ -12,6 +12,7 @@ import time
 import threading
 import subprocess
 import mmap
+import fcntl
 import gi
 gi.require_version('Nautilus', '4.1')
 from gi.repository import Nautilus, GObject, GLib
@@ -102,16 +103,20 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                         "mtime": prev.get("mtime", 0),
                         "path_to_id": prev.get("path_to_id", {}),
                         "id_to_path": prev.get("id_to_path", {}),
-                        "io_lock": prev.get("io_lock") or threading.Lock()
+                        "io_lock": prev.get("io_lock") or threading.Lock(),
+                        "db_lock": prev.get("db_lock") or threading.Lock(),
+                        "db_gen": prev.get("db_gen", 0),
+                        "loading_db": prev.get("loading_db", False)
                     }
         self.mounts = active_mounts
         # Prune cached_ids for any mount that was removed
         active_cache_dirs = {m["cache_dir"] for m in active_mounts.values()}
         self.cached_ids = {k: v for k, v in self.cached_ids.items() if k in active_cache_dirs}
 
-    def _parse_db_file(self, db_path: str, mtime: float, mount_info: dict, file_to_invalidate=None):
+    def _parse_db_file(self, db_path: str, mtime: float, mount_info: dict, gen: int, files_to_invalidate=None):
         if not os.path.isfile(db_path) or os.path.getsize(db_path) == 0:
-            mount_info["loading_db"] = False
+            with mount_info["db_lock"]:
+                mount_info["loading_db"] = False
             return
         try:
             with open(db_path, "rb") as f:
@@ -121,7 +126,6 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
             path_to_id = {}
             id_to_path = {}
             for item_id_b, name_b, parent_b, kind_b in matches:
-                # We only track files for caching and emblem computation!
                 if kind_b != b"file":
                     continue
                 item_id = item_id_b.decode("utf-8", errors="ignore")
@@ -134,26 +138,30 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                 id_to_path[item_id] = rel_path
 
             def apply_snapshot():
+                if mount_info.get("db_gen") != gen:
+                    return False
                 mount_info["mtime"] = mtime
                 mount_info["path_to_id"] = path_to_id
                 mount_info["id_to_path"] = id_to_path
                 cache_dir = mount_info.get("cache_dir")
                 if cache_dir:
                     self.cached_ids.pop(cache_dir, None)
-                if file_to_invalidate:
-                    try:
-                        file_to_invalidate.invalidate_extension_info()
-                    except Exception:
-                        pass
+                if files_to_invalidate:
+                    for f in files_to_invalidate:
+                        try:
+                            f.invalidate_extension_info()
+                        except Exception:
+                            pass
+                with mount_info["db_lock"]:
+                    mount_info["loading_db"] = False
                 return False
 
             GLib.idle_add(apply_snapshot)
         except Exception:
-            pass
-        finally:
-            mount_info["loading_db"] = False
+            with mount_info["db_lock"]:
+                mount_info["loading_db"] = False
 
-    def _load_db_if_needed(self, mount_info: dict, file_to_invalidate=None):
+    def _load_db_if_needed(self, mount_info: dict, files_to_invalidate=None):
         db_path = mount_info["db_path"]
         if not os.path.isfile(db_path) or os.path.getsize(db_path) == 0:
             return
@@ -163,9 +171,15 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
             if mtime <= mount_info.get("mtime", 0) and mount_info.get("path_to_id"):
                 return
 
-            if not mount_info.get("loading_db"):
+            with mount_info["db_lock"]:
+                if mount_info.get("loading_db"):
+                    return
                 mount_info["loading_db"] = True
-                threading.Thread(target=self._parse_db_file, args=(db_path, mtime, mount_info, file_to_invalidate), daemon=True).start()
+                mount_info["db_gen"] = mount_info.get("db_gen", 0) + 1
+                gen = mount_info["db_gen"]
+
+            files_list = [files_to_invalidate] if isinstance(files_to_invalidate, Nautilus.FileInfo) else (files_to_invalidate or [])
+            threading.Thread(target=self._parse_db_file, args=(db_path, mtime, mount_info, gen, files_list), daemon=True).start()
         except Exception:
             pass
 
@@ -187,20 +201,12 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
 
         self.cached_ids[mp] = (cached, now)
 
-        # Precompute cached folders and folder-to-IDs map for instant O(1) lookups
+        # Precompute folder states for fast emblem checks without huge memory overhead
         cached_folders = set()
         cloud_folders = set()
-        folder_to_cids = {"": []}
         path_to_id = mount_info.get("path_to_id", {})
         for p, cid in path_to_id.items():
-            folder_to_cids[""].append(cid)
             parts = p.split("/")
-            for i in range(1, len(parts)):
-                folder = "/".join(parts[:i])
-                if folder not in folder_to_cids:
-                    folder_to_cids[folder] = []
-                folder_to_cids[folder].append(cid)
-
             if cid in cached:
                 cached_folders.add("")
                 for i in range(1, len(parts)):
@@ -212,7 +218,6 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
 
         mount_info["cached_folders"] = cached_folders
         mount_info["cloud_folders"] = cloud_folders
-        mount_info["folder_to_cids"] = folder_to_cids
         return cached
 
     def _match_mount(self, file_path: str):
@@ -293,7 +298,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
             if not mp or not mount_info:
                 continue
 
-            self._load_db_if_needed(mount_info)
+            self._load_db_if_needed(mount_info, files)
             cached_ids = self._get_cached_ids(mount_info)
             rel_path = "" if file_path == mp else os.path.relpath(file_path, mp)
             path_to_id = mount_info.get("path_to_id", {})
@@ -364,10 +369,18 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                         mounts_involved[cd] = mi.get("io_lock") or threading.Lock()
 
             acquired = []
+            flock_files = []
             for cd in sorted(mounts_involved.keys()):
                 lock = mounts_involved[cd]
                 lock.acquire()
                 acquired.append(lock)
+                try:
+                    lock_file = os.path.join(cd, ".lock")
+                    lf = open(lock_file, "w")
+                    fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+                    flock_files.append(lf)
+                except Exception:
+                    pass
 
             try:
                 freed = 0
@@ -381,15 +394,16 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                     affected_mounts.add(mount_info.get("cache_dir"))
 
                     if is_dir:
-                        cids = mount_info.get("folder_to_cids", {}).get(rel_path, [])
-                        for cid in cids:
-                            cf = os.path.join(content_dir, cid)
-                            if os.path.isfile(cf):
-                                try:
-                                    os.remove(cf)
-                                    freed += 1
-                                except Exception:
-                                    pass
+                        prefix = "" if not rel_path else (rel_path + "/")
+                        for p, cid in path_to_id.items():
+                            if not prefix or p.startswith(prefix):
+                                cf = os.path.join(content_dir, cid)
+                                if os.path.isfile(cf):
+                                    try:
+                                        os.remove(cf)
+                                        freed += 1
+                                    except Exception:
+                                        pass
                     else:
                         if item_id:
                             cf = os.path.join(content_dir, item_id)
@@ -414,6 +428,12 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                 if freed > 0:
                     _notify("OneDrive: Espacio liberado", f"Se desalojaron {freed} archivo(s) del equipo sin eliminarlos de la nube.", "onedrive-custom-cloud")
             finally:
+                for lf in flock_files:
+                    try:
+                        fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+                        lf.close()
+                    except Exception:
+                        pass
                 for lock in reversed(acquired):
                     lock.release()
 
@@ -421,15 +441,21 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
 
     def _on_download_activate(self, menu_item, onedrive_files):
         with self._sync_lock:
-            # Filter out targets that are already actively syncing (or within a syncing directory)
-            targets_to_download = [
+            # 1. Prune child targets if ancestor directory is already in selection
+            selected_dirs = {f[1] for f in onedrive_files if f[5]}
+            pruned_files = [
                 f for f in onedrive_files
+                if not any(f[1] != d and f[1].startswith(d + "/") for d in selected_dirs)
+            ]
+            # 2. Filter out targets that are already actively syncing (or within a syncing directory)
+            targets_to_download = [
+                f for f in pruned_files
                 if not any(f[1] == p or f[1].startswith(p + "/") for p in self.syncing_paths)
             ]
             if not targets_to_download:
                 return
 
-            # 1. Immediately mark target files as syncing and trigger emblem update
+            # 3. Immediately mark target files as syncing and trigger emblem update
             for file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded in targets_to_download:
                 self.syncing_paths.add(file_path)
                 try:
@@ -447,10 +473,18 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                         mounts_involved[cd] = mi.get("io_lock") or threading.Lock()
 
             acquired = []
+            flock_files = []
             for cd in sorted(mounts_involved.keys()):
                 lock = mounts_involved[cd]
                 lock.acquire()
                 acquired.append(lock)
+                try:
+                    lock_file = os.path.join(cd, ".lock")
+                    lf = open(lock_file, "w")
+                    fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+                    flock_files.append(lf)
+                except Exception:
+                    pass
 
             downloaded = 0
             affected_mounts = set()
@@ -501,7 +535,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                             with self._sync_lock:
                                 self.syncing_paths.discard(file_path)
             finally:
-                # 2. Clear syncing state and invalidate cache
+                # Clear syncing state and invalidate cache
                 with self._sync_lock:
                     for file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded in targets_to_download:
                         self.syncing_paths.discard(file_path)
@@ -516,6 +550,12 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                     except Exception:
                         pass
 
+                for lf in flock_files:
+                    try:
+                        fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+                        lf.close()
+                    except Exception:
+                        pass
                 for lock in reversed(acquired):
                     lock.release()
 

@@ -9,6 +9,7 @@ import sys
 import subprocess
 import mmap
 import re
+import fcntl
 
 raw_paths = os.environ.get("NAUTILUS_SCRIPT_SELECTED_FILE_PATHS", "")
 selected_paths = [p for p in raw_paths.splitlines() if p]
@@ -106,66 +107,90 @@ def get_db_info(db_path):
     db_cache[db_path] = path_to_id
     return path_to_id
 
+selected_dirs = {p for p in selected_paths if os.path.isdir(p)}
+pruned_paths = [
+    p for p in selected_paths
+    if not any(p != d and p.startswith(d + "/") for d in selected_dirs)
+]
+
 downloaded_count = 0
 buf = bytearray(1024 * 1024)
 mv = memoryview(buf)
+locks = {}
 
-for target in selected_paths:
-    if not target:
-        continue
-
-    # Match mount
-    matched_mp = None
-    matched_info = None
-    for mp in sorted(mounts.keys(), key=len, reverse=True):
-        if target == mp or target.startswith(mp + "/"):
-            matched_mp = mp
-            matched_info = mounts[mp]
-            break
-
-    if not matched_mp:
-        continue
-
-    content_dir = matched_info["content_dir"]
-    db_path = matched_info["db_path"]
-    if not os.path.isdir(content_dir) or not os.path.isfile(db_path):
-        continue
-
-    cached_ids = set()
-    if os.path.isdir(content_dir):
-        try:
-            cached_ids = set(os.listdir(content_dir))
-        except Exception:
-            pass
-
-    path_to_id = get_db_info(db_path)
-    is_dir = (target == matched_mp) or os.path.isdir(target)
-
-    if is_dir:
-        for root_dir, _, filenames in os.walk(target):
-            for fn in filenames:
-                fp = os.path.join(root_dir, fn)
-                rel_f = os.path.relpath(fp, matched_mp)
-                cid = path_to_id.get(rel_f)
-                if cid and cid in cached_ids:
-                    continue
-                try:
-                    with open(fp, "rb") as f:
-                        while f.readinto(mv):
-                            pass
-                    downloaded_count += 1
-                except Exception:
-                    pass
-    else:
-        rel_f = os.path.relpath(target, matched_mp)
-        cid = path_to_id.get(rel_f)
-        if cid and cid in cached_ids:
+try:
+    for target in pruned_paths:
+        if not target:
             continue
+
+        # Match mount
+        matched_mp = None
+        matched_info = None
+        for mp in sorted(mounts.keys(), key=len, reverse=True):
+            if target == mp or target.startswith(mp + "/"):
+                matched_mp = mp
+                matched_info = mounts[mp]
+                break
+
+        if not matched_mp:
+            continue
+
+        content_dir = matched_info["content_dir"]
+        db_path = matched_info["db_path"]
+        cache_dir = matched_info["cache_dir"]
+        if not os.path.isdir(content_dir) or not os.path.isfile(db_path):
+            continue
+
+        if cache_dir not in locks:
+            try:
+                lf = open(os.path.join(cache_dir, ".lock"), "w")
+                fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+                locks[cache_dir] = lf
+            except Exception:
+                pass
+
+        cached_ids = set()
+        if os.path.isdir(content_dir):
+            try:
+                cached_ids = set(os.listdir(content_dir))
+            except Exception:
+                pass
+
+        path_to_id = get_db_info(db_path)
+        is_dir = (target == matched_mp) or os.path.isdir(target)
+
+        if is_dir:
+            for root_dir, _, filenames in os.walk(target):
+                for fn in filenames:
+                    fp = os.path.join(root_dir, fn)
+                    rel_f = os.path.relpath(fp, matched_mp)
+                    cid = path_to_id.get(rel_f)
+                    if cid and cid in cached_ids:
+                        continue
+                    try:
+                        with open(fp, "rb") as f:
+                            while f.readinto(mv):
+                                pass
+                        downloaded_count += 1
+                    except Exception:
+                        pass
+        else:
+            rel_f = os.path.relpath(target, matched_mp)
+            cid = path_to_id.get(rel_f)
+            if cid and cid in cached_ids:
+                continue
+            try:
+                with open(target, "rb") as f:
+                    while f.readinto(mv):
+                        pass
+                downloaded_count += 1
+            except Exception:
+                pass
+finally:
+    for lf in locks.values():
         try:
-            with open(target, "rb") as f:
-                while f.readinto(mv):
-                    pass
-            downloaded_count += 1
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+            lf.close()
         except Exception:
             pass
 
