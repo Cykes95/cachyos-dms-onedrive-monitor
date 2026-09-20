@@ -33,6 +33,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
         self.last_mount_check = 0
         self.cached_ids = {} # mountpoint -> (set_of_ids, timestamp)
         self.syncing_paths = set()
+        self.download_lock = threading.Lock()
         self._refresh_mounts()
 
     def _unescape_systemd(self, encoded: str) -> str:
@@ -89,16 +90,8 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                     }
         self.mounts = active_mounts
 
-    def _load_db_if_needed(self, mount_info: dict):
-        db_path = mount_info["db_path"]
-        if not os.path.isfile(db_path):
-            return
-
+    def _parse_db_file(self, db_path: str, mtime: float, mount_info: dict):
         try:
-            mtime = os.path.getmtime(db_path)
-            if mtime <= mount_info.get("mtime", 0) and mount_info["path_to_id"]:
-                return
-
             with open(db_path, "rb") as f:
                 with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
                     matches = DB_PATTERN.findall(mm)
@@ -118,6 +111,31 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
             mount_info["mtime"] = mtime
             mount_info["path_to_id"] = path_to_id
             mount_info["id_to_path"] = id_to_path
+            cache_dir = mount_info.get("cache_dir")
+            if cache_dir:
+                self.cached_ids.pop(cache_dir, None)
+        except Exception:
+            pass
+        finally:
+            mount_info["loading_db"] = False
+
+    def _load_db_if_needed(self, mount_info: dict):
+        db_path = mount_info["db_path"]
+        if not os.path.isfile(db_path):
+            return
+
+        try:
+            mtime = os.path.getmtime(db_path)
+            if mtime <= mount_info.get("mtime", 0) and mount_info.get("path_to_id"):
+                return
+
+            if mount_info.get("path_to_id"):
+                if not mount_info.get("loading_db"):
+                    mount_info["loading_db"] = True
+                    threading.Thread(target=self._parse_db_file, args=(db_path, mtime, mount_info), daemon=True).start()
+                return
+
+            self._parse_db_file(db_path, mtime, mount_info)
         except Exception:
             pass
 
@@ -352,46 +370,47 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                 pass
 
         def worker():
-            downloaded = 0
-            affected_mounts = set()
-            try:
-                for file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded in targets_to_download:
-                    affected_mounts.add(mount_info.get("cache_dir"))
-                    if is_dir:
-                        for root_dir, _, filenames in os.walk(file_path):
-                            for fn in filenames:
-                                fp = os.path.join(root_dir, fn)
-                                try:
-                                    with open(fp, "rb") as f:
-                                        while f.read(1024 * 1024):
-                                            pass
-                                    downloaded += 1
-                                except Exception:
-                                    pass
-                    else:
+            with self.download_lock:
+                downloaded = 0
+                affected_mounts = set()
+                try:
+                    for file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded in targets_to_download:
+                        affected_mounts.add(mount_info.get("cache_dir"))
+                        if is_dir:
+                            for root_dir, _, filenames in os.walk(file_path):
+                                for fn in filenames:
+                                    fp = os.path.join(root_dir, fn)
+                                    try:
+                                        with open(fp, "rb") as f:
+                                            while f.read(1024 * 1024):
+                                                pass
+                                        downloaded += 1
+                                    except Exception:
+                                        pass
+                        else:
+                            try:
+                                with open(file_path, "rb") as f:
+                                    while f.read(1024 * 1024):
+                                        pass
+                                downloaded += 1
+                            except Exception:
+                                pass
+                finally:
+                    # 2. Clear syncing state and invalidate cache
+                    for file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded in targets_to_download:
+                        self.syncing_paths.discard(file_path)
+
+                    for cd in affected_mounts:
+                        if cd:
+                            self.cached_ids.pop(cd, None)
+
+                    for file, _, _, _, _, _, _, _ in targets_to_download:
                         try:
-                            with open(file_path, "rb") as f:
-                                while f.read(1024 * 1024):
-                                    pass
-                            downloaded += 1
+                            GLib.idle_add(file.invalidate_extension_info)
                         except Exception:
                             pass
-            finally:
-                # 2. Clear syncing state and invalidate cache
-                for file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded in targets_to_download:
-                    self.syncing_paths.discard(file_path)
 
-                for cd in affected_mounts:
-                    if cd:
-                        self.cached_ids.pop(cd, None)
-
-                for file, _, _, _, _, _, _, _ in targets_to_download:
-                    try:
-                        GLib.idle_add(file.invalidate_extension_info)
-                    except Exception:
-                        pass
-
-                if downloaded > 0:
-                    _notify("OneDrive: Descarga completada", f"Se descargaron {downloaded} archivo(s) para uso sin conexión.", "onedrive-custom-synced")
+                    if downloaded > 0:
+                        _notify("OneDrive: Descarga completada", f"Se descargaron {downloaded} archivo(s) para uso sin conexión.", "onedrive-custom-synced")
 
         threading.Thread(target=worker, daemon=True).start()
