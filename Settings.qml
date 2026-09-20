@@ -15,15 +15,15 @@ PluginSettings {
 
         SelectionSetting {
             settingKey: "pollSeconds"
-            label: "Intervalo de actualización"
-            description: "Frecuencia de consulta del estado de los servicios, espacio y logs"
+            label: "Intervalo en segundo plano"
+            description: "Frecuencia de sondeo en reposo (al abrir el panel siempre se acelera a 2 s)"
             options: [
                 { label: "2 segundos (intensivo)", value: "2" },
-                { label: "5 segundos (recomendado)", value: "5" },
-                { label: "10 segundos (ahorro)", value: "10" },
-                { label: "30 segundos (mínimo)", value: "30" }
+                { label: "5 segundos (estándar)", value: "5" },
+                { label: "15 segundos (recomendado)", value: "15" },
+                { label: "30 segundos (ahorro de batería)", value: "30" }
             ]
-            defaultValue: "5"
+            defaultValue: "15"
         }
 
         ToggleSetting {

@@ -94,20 +94,27 @@ PROP_EOF
         mounted=1
     fi
 
-    # Optimization: Cache size lookup with 30-second TTL
+    # Optimization: Cache size lookup with mtime verification & 30-second TTL
     cache_bytes=0
     cache_size_file="/tmp/onedriver_cache_${encoded}.tmp"
+    cur_mtime=$(stat -c %Y "$cache_entry/content" 2>/dev/null || echo 0)
+    cur_db_sz=$(stat -c %s "$cache_entry/onedriver.db" 2>/dev/null || echo 0)
+    need_du=1
+
     if [ -r "$cache_size_file" ]; then
-        read -r last_ts cached_val < "$cache_size_file" 2>/dev/null || true
-        if [ -n "$last_ts" ] && [ "$((now - last_ts))" -lt 30 ] && [ -n "$cached_val" ]; then
-            cache_bytes="$cached_val"
+        read -r last_ts last_mtime last_db_sz cached_val < "$cache_size_file" 2>/dev/null || true
+        if [ -n "$last_ts" ] && [ -n "$cached_val" ]; then
+            if [ "$((now - last_ts))" -lt 30 ] || { [ "$last_mtime" = "$cur_mtime" ] && [ "$last_db_sz" = "$cur_db_sz" ]; }; then
+                cache_bytes="$cached_val"
+                need_du=0
+            fi
         fi
     fi
-    if [ "$cache_bytes" -eq 0 ] && [ -d "$cache_entry" ]; then
+    if [ "$need_du" -eq 1 ] && [ -d "$cache_entry" ]; then
         cache_bytes=$(du -sb "$cache_entry" 2>/dev/null | awk 'NR == 1 {print $1}')
         case "$cache_bytes" in
             ''|*[!0-9]*) cache_bytes=0 ;;
-            *) printf '%s %s\n' "$now" "$cache_bytes" > "$cache_size_file" 2>/dev/null || true ;;
+            *) printf '%s %s %s %s\n' "$now" "$cur_mtime" "$cur_db_sz" "$cache_bytes" > "$cache_size_file" 2>/dev/null || true ;;
         esac
     fi
 
@@ -139,15 +146,27 @@ Q_EOF
         fi
     fi
 
-    # Optimization: Only run journalctl if service is active
+    # Optimization: Cache journalctl activity for 10s when active
     activity=""
     if [ "$active" = "active" ]; then
-        activity=$(journalctl --user -u "$unit" --since "5 minutes ago" -n 25 --no-pager --quiet -o cat 2>/dev/null \
-            | grep -Ei 'uploading|uploaded|download|offline|online|retry|failed|error' \
-            | tail -n 1 \
-            | tr '\t\r\n' ' ' \
-            | sed -E 's/\x1B\[[0-9;]*[[:alpha:]]//g' \
-            | sed 's/[[:space:]][[:space:]]*/ /g')
+        act_cache_file="/tmp/onedriver_act_${encoded}.tmp"
+        read_act=1
+        if [ -r "$act_cache_file" ]; then
+            read -r last_act_ts last_act < "$act_cache_file" 2>/dev/null || true
+            if [ -n "$last_act_ts" ] && [ "$((now - last_act_ts))" -lt 10 ]; then
+                activity="$last_act"
+                read_act=0
+            fi
+        fi
+        if [ "$read_act" -eq 1 ]; then
+            activity=$(journalctl --user -u "$unit" --since "5 minutes ago" -n 25 --no-pager --quiet -o cat 2>/dev/null \
+                | grep -Ei 'uploading|uploaded|download|offline|online|retry|failed|error' \
+                | tail -n 1 \
+                | tr '\t\r\n' ' ' \
+                | sed -E 's/\x1B\[[0-9;]*[[:alpha:]]//g' \
+                | sed 's/[[:space:]][[:space:]]*/ /g')
+            printf '%s %s\n' "$now" "$activity" > "$act_cache_file" 2>/dev/null || true
+        fi
     fi
 
     # Optimization: Count files by content directory mtime

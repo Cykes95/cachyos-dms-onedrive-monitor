@@ -49,48 +49,77 @@ shift 1 2>/dev/null || true
 case "$cmd" in
     start)
         unit=$(normalize_unit "$1")
-        systemctl --user start "$unit" 2>/dev/null || true
-        echo "started $unit"
-        exit 0
+        if out=$(systemctl --user start "$unit" 2>&1); then
+            echo "started $unit"
+            exit 0
+        else
+            echo "Error al iniciar $unit: $out" >&2
+            exit 1
+        fi
         ;;
     stop)
         unit=$(normalize_unit "$1")
-        systemctl --user stop "$unit" 2>/dev/null || true
-        echo "stopped $unit"
-        exit 0
+        if out=$(systemctl --user stop "$unit" 2>&1); then
+            echo "stopped $unit"
+            exit 0
+        else
+            echo "Error al detener $unit: $out" >&2
+            exit 1
+        fi
         ;;
     restart)
         unit=$(normalize_unit "$1")
-        systemctl --user restart "$unit" 2>/dev/null || true
-        echo "restarted $unit"
-        exit 0
+        if out=$(systemctl --user restart "$unit" 2>&1); then
+            echo "restarted $unit"
+            exit 0
+        else
+            echo "Error al reiniciar $unit: $out" >&2
+            exit 1
+        fi
         ;;
     enable)
         unit=$(normalize_unit "$1")
-        systemctl --user enable "$unit" 2>/dev/null || true
-        echo "enabled $unit"
-        exit 0
+        if out=$(systemctl --user enable "$unit" 2>&1); then
+            echo "enabled $unit"
+            exit 0
+        else
+            echo "Error al habilitar inicio automático de $unit: $out" >&2
+            exit 1
+        fi
         ;;
     disable)
         unit=$(normalize_unit "$1")
-        systemctl --user disable "$unit" 2>/dev/null || true
-        echo "disabled $unit"
-        exit 0
+        if out=$(systemctl --user disable "$unit" 2>&1); then
+            echo "disabled $unit"
+            exit 0
+        else
+            echo "Error al deshabilitar inicio automático de $unit: $out" >&2
+            exit 1
+        fi
         ;;
     toggle-autostart)
         unit=$(normalize_unit "$1")
         state=$(systemctl --user is-enabled "$unit" 2>/dev/null || true)
         case "$state" in
             enabled*)
-                systemctl --user disable "$unit" 2>/dev/null || true
-                echo "disabled $unit"
+                if out=$(systemctl --user disable "$unit" 2>&1); then
+                    echo "disabled $unit"
+                    exit 0
+                else
+                    echo "Error al desactivar inicio automático: $out" >&2
+                    exit 1
+                fi
                 ;;
             *)
-                systemctl --user enable "$unit" 2>/dev/null || true
-                echo "enabled $unit"
+                if out=$(systemctl --user enable "$unit" 2>&1); then
+                    echo "enabled $unit"
+                    exit 0
+                else
+                    echo "Error al activar inicio automático: $out" >&2
+                    exit 1
+                fi
                 ;;
         esac
-        exit 0
         ;;
     mount-all)
         if [ -d "$cache_dir" ]; then
@@ -160,30 +189,51 @@ case "$cmd" in
         icons_dir="$home_dir/.local/share/icons/hicolor"
         ext_dir="$home_dir/.local/share/nautilus-python/extensions"
         scripts_dir="$home_dir/.local/share/nautilus/scripts"
+        systemd_override_dir="$home_dir/.config/systemd/user/onedriver@.service.d"
 
-        mkdir -p "$icons_dir/scalable/emblems" "$icons_dir/48x48/emblems" "$ext_dir" "$scripts_dir"
+        mkdir -p "$icons_dir/scalable/emblems" "$icons_dir/48x48/emblems" "$ext_dir" "$scripts_dir" "$systemd_override_dir"
+
+        needs_icon_cache=0
 
         if [ -d "$script_dir/assets/emblems" ]; then
-            cp -f "$script_dir/assets/emblems"/*.svg "$icons_dir/scalable/emblems/" 2>/dev/null || true
-            cp -f "$script_dir/assets/emblems"/*.svg "$icons_dir/48x48/emblems/" 2>/dev/null || true
+            for icon in "$script_dir/assets/emblems"/*.svg; do
+                [ -f "$icon" ] || continue
+                base=$(basename "$icon")
+                dest_sc="$icons_dir/scalable/emblems/$base"
+                dest_48="$icons_dir/48x48/emblems/$base"
+                if [ ! -f "$dest_sc" ] || ! cmp -s "$icon" "$dest_sc"; then
+                    cp -f "$icon" "$dest_sc" 2>/dev/null || true
+                    needs_icon_cache=1
+                fi
+                if [ ! -f "$dest_48" ] || ! cmp -s "$icon" "$dest_48"; then
+                    cp -f "$icon" "$dest_48" 2>/dev/null || true
+                    needs_icon_cache=1
+                fi
+            done
         fi
 
-        if [ -f "$script_dir/integrations/nautilus/onedrive_extension.py" ]; then
-            cp -f "$script_dir/integrations/nautilus/onedrive_extension.py" "$ext_dir/" 2>/dev/null || true
+        src_ext="$script_dir/integrations/nautilus/onedrive_extension.py"
+        dest_ext="$ext_dir/onedrive_extension.py"
+        if [ -f "$src_ext" ]; then
+            if [ ! -f "$dest_ext" ] || ! cmp -s "$src_ext" "$dest_ext"; then
+                cp -f "$src_ext" "$dest_ext" 2>/dev/null || true
+            fi
         fi
 
-        if [ -f "$script_dir/integrations/nautilus/OneDrive - Liberar espacio local" ]; then
-            cp -f "$script_dir/integrations/nautilus/OneDrive - Liberar espacio local" "$scripts_dir/" 2>/dev/null || true
-            chmod +x "$scripts_dir/OneDrive - Liberar espacio local" 2>/dev/null || true
+        src_script="$script_dir/integrations/nautilus/OneDrive - Liberar espacio local"
+        dest_script="$scripts_dir/OneDrive - Liberar espacio local"
+        if [ -f "$src_script" ]; then
+            if [ ! -f "$dest_script" ] || ! cmp -s "$src_script" "$dest_script"; then
+                cp -f "$src_script" "$dest_script" 2>/dev/null || true
+                chmod +x "$dest_script" 2>/dev/null || true
+            fi
         fi
 
-        if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+        if [ "$needs_icon_cache" -eq 1 ] && command -v gtk-update-icon-cache >/dev/null 2>&1; then
             gtk-update-icon-cache -f -t "$icons_dir" 2>/dev/null || true
         fi
 
         # Ensure systemd user drop-in exists so onedriver unmount quirks never show as failures
-        systemd_override_dir="$home_dir/.config/systemd/user/onedriver@.service.d"
-        mkdir -p "$systemd_override_dir" 2>/dev/null || true
         if [ ! -f "$systemd_override_dir/override.conf" ]; then
             printf '[Service]\nExecStopPost=\nExecStopPost=-/usr/bin/fusermount3 -uz /%%I\n' > "$systemd_override_dir/override.conf" 2>/dev/null || true
             systemctl --user daemon-reload 2>/dev/null || true

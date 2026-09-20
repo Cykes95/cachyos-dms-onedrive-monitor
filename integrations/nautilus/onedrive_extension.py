@@ -12,6 +12,7 @@ import time
 import urllib.parse
 import threading
 import subprocess
+import mmap
 import gi
 gi.require_version('Nautilus', '4.1')
 from gi.repository import Nautilus, GObject, Gio, GLib
@@ -99,9 +100,8 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                 return
 
             with open(db_path, "rb") as f:
-                raw = f.read()
-
-            matches = DB_PATTERN.findall(raw)
+                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                    matches = DB_PATTERN.findall(mm)
 
             path_to_id = {}
             id_to_path = {}
@@ -139,12 +139,19 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
 
         self.cached_ids[mp] = (cached, now)
 
-        # Precompute cached folders for instant O(1) directory lookups
+        # Precompute cached folders and folder-to-IDs map for instant O(1) lookups
         cached_folders = set()
         cloud_folders = set()
+        folder_to_cids = {}
         path_to_id = mount_info.get("path_to_id", {})
         for p, cid in path_to_id.items():
             parts = p.split("/")
+            for i in range(1, len(parts)):
+                folder = "/".join(parts[:i])
+                if folder not in folder_to_cids:
+                    folder_to_cids[folder] = []
+                folder_to_cids[folder].append(cid)
+
             if cid in cached:
                 for i in range(1, len(parts)):
                     cached_folders.add("/".join(parts[:i]))
@@ -154,6 +161,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
 
         mount_info["cached_folders"] = cached_folders
         mount_info["cloud_folders"] = cloud_folders
+        mount_info["folder_to_cids"] = folder_to_cids
         return cached
 
     def _match_mount(self, file_path: str):
@@ -294,16 +302,15 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                 affected_mounts.add(mount_info.get("cache_dir"))
 
                 if is_dir:
-                    prefix = rel_path + "/"
-                    for p, cid in path_to_id.items():
-                        if p.startswith(prefix):
-                            cf = os.path.join(content_dir, cid)
-                            if os.path.isfile(cf):
-                                try:
-                                    os.remove(cf)
-                                    freed += 1
-                                except Exception:
-                                    pass
+                    cids = mount_info.get("folder_to_cids", {}).get(rel_path, [])
+                    for cid in cids:
+                        cf = os.path.join(content_dir, cid)
+                        if os.path.isfile(cf):
+                            try:
+                                os.remove(cf)
+                                freed += 1
+                            except Exception:
+                                pass
                 else:
                     if item_id:
                         cf = os.path.join(content_dir, item_id)
@@ -331,8 +338,13 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_download_activate(self, menu_item, onedrive_files):
+        # Filter out targets that are already actively syncing to prevent duplicate downloads
+        targets_to_download = [f for f in onedrive_files if f[1] not in self.syncing_paths]
+        if not targets_to_download:
+            return
+
         # 1. Immediately mark target files as syncing and trigger emblem update
-        for file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded in onedrive_files:
+        for file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded in targets_to_download:
             self.syncing_paths.add(file_path)
             try:
                 file.invalidate_extension_info()
@@ -343,7 +355,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
             downloaded = 0
             affected_mounts = set()
             try:
-                for file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded in onedrive_files:
+                for file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded in targets_to_download:
                     affected_mounts.add(mount_info.get("cache_dir"))
                     if is_dir:
                         for root_dir, _, filenames in os.walk(file_path):
@@ -366,14 +378,14 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                             pass
             finally:
                 # 2. Clear syncing state and invalidate cache
-                for file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded in onedrive_files:
+                for file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded in targets_to_download:
                     self.syncing_paths.discard(file_path)
 
                 for cd in affected_mounts:
                     if cd:
                         self.cached_ids.pop(cd, None)
 
-                for file, _, _, _, _, _, _, _ in onedrive_files:
+                for file, _, _, _, _, _, _, _ in targets_to_download:
                     try:
                         GLib.idle_add(file.invalidate_extension_info)
                     except Exception:

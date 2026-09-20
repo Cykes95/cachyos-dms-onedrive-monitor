@@ -20,13 +20,17 @@ PluginComponent {
     property var pendingUnits: ({})
     property bool popoutVisible: false
 
+    readonly property string pluginPath: String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "").replace(/\/+$/, "")
+    readonly property string monitorPath: pluginPath + "/monitor.sh"
+    readonly property string actionsPath: pluginPath + "/actions.sh"
+
     readonly property int pollIntervalMs: {
         if (popoutVisible)
-            return 2500;
+            return 2000;
         if (transferCount > 0)
-            return 4000;
-        const seconds = Number((pluginData && pluginData.pollSeconds) || 10);
-        return Math.max(5000, Math.min(60000, (isNaN(seconds) ? 10 : seconds) * 1000));
+            return 3500;
+        const seconds = Number((pluginData && pluginData.pollSeconds) || 15);
+        return Math.max(2000, Math.min(60000, (isNaN(seconds) ? 15 : seconds) * 1000));
     }
     readonly property bool showCache: !pluginData || pluginData.showCache === undefined || pluginData.showCache === true || pluginData.showCache === "true"
     readonly property bool showInactive: !pluginData || pluginData.showInactive === undefined || pluginData.showInactive === true || pluginData.showInactive === "true"
@@ -41,15 +45,6 @@ PluginComponent {
         } else {
             Quickshell.execDetached(["sh", actionsPath, "uninstall-nautilus"]);
         }
-    }
-
-    readonly property string monitorPath: {
-        const home = Quickshell.env("HOME") || "";
-        return home ? home + "/.config/DankMaterialShell/plugins/OneDriveMonitor/monitor.sh" : "";
-    }
-    readonly property string actionsPath: {
-        const home = Quickshell.env("HOME") || "";
-        return home ? home + "/.config/DankMaterialShell/plugins/OneDriveMonitor/actions.sh" : "";
     }
 
     readonly property var visibleMounts: {
