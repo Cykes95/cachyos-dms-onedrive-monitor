@@ -29,7 +29,10 @@ if [ -r "$config_file" ]; then
 fi
 
 locks_dir="${XDG_RUNTIME_DIR:-/run/user/${UID:-$(id -u)}}/onedrive_locks"
-mkdir -p "$locks_dir" 2>/dev/null && chmod 700 "$locks_dir" 2>/dev/null || true
+mkdir -p "$locks_dir" 2>/dev/null && chmod 700 "$locks_dir" 2>/dev/null || {
+    locks_dir="/tmp/onedriver_locks_${UID:-$(id -u)}"
+    mkdir -p "$locks_dir" 2>/dev/null && chmod 700 "$locks_dir" 2>/dev/null || true
+}
 
 acquire_account_lock() {
     enc="$1"
@@ -46,6 +49,14 @@ release_account_lock() {
     flock -u 9 2>/dev/null || true
     exec 9>&- 2>/dev/null || true
 }
+
+trap_cleanup() {
+    release_account_lock
+    exit 1
+}
+
+trap trap_cleanup INT TERM HUP
+trap release_account_lock EXIT
 
 normalize_unit() {
     val="$1"
@@ -128,9 +139,13 @@ ensure_systemd_override() {
     if [ -f "$systemd_override_dir/override.conf" ] && grep -Fqs "Created by DMS OneDriveMonitor" "$systemd_override_dir/override.conf"; then
         rm -f "$systemd_override_dir/override.conf" 2>/dev/null || true
     fi
-    if [ ! -f "$override_file" ]; then
+    needs_reload=0
+    if [ ! -f "$override_file" ] || grep -Fqs -- "-uz" "$override_file"; then
         mkdir -p "$systemd_override_dir" 2>/dev/null || true
-        printf '# Created by DMS OneDriveMonitor\n[Service]\nExecStopPost=\nExecStopPost=-%s -uz /%%I\n' "$fusermount_bin" > "$override_file" 2>/dev/null || true
+        printf '# Created by DMS OneDriveMonitor\n[Service]\nExecStopPost=\nExecStopPost=-%s -u /%%I\n' "$fusermount_bin" > "$override_file" 2>/dev/null || true
+        needs_reload=1
+    fi
+    if [ "$needs_reload" -eq 1 ]; then
         systemctl --user daemon-reload 2>/dev/null || true
     fi
 }
@@ -143,6 +158,10 @@ case "$cmd" in
         [ -n "$1" ] || { echo "Error: falta el identificador o nombre de unidad" >&2; exit 1; }
         encoded=$(normalize_encoded "$1")
         validate_encoded "$encoded"
+        if ! acquire_account_lock "$encoded"; then
+            echo "Error: la cuenta $encoded está ocupada por otra operación" >&2
+            exit 1
+        fi
         ensure_systemd_override
         unit="onedriver@${encoded}.service"
         if out=$(systemctl --user start "$unit" 2>&1); then
@@ -157,6 +176,10 @@ case "$cmd" in
         [ -n "$1" ] || { echo "Error: falta el identificador o nombre de unidad" >&2; exit 1; }
         encoded=$(normalize_encoded "$1")
         validate_encoded "$encoded"
+        if ! acquire_account_lock "$encoded"; then
+            echo "Error: la cuenta $encoded está ocupada por otra operación" >&2
+            exit 1
+        fi
         unit="onedriver@${encoded}.service"
         mountpoint=$(systemd-escape --unescape --path "$encoded" 2>/dev/null || true)
         if out=$(systemctl --user stop "$unit" 2>&1); then
@@ -165,7 +188,7 @@ case "$cmd" in
             fi
             if [ -n "$mountpoint" ] && is_mounted "$mountpoint"; then
                 fusermount_bin=$(command -v fusermount3 || command -v fusermount || true)
-                [ -n "$fusermount_bin" ] && "$fusermount_bin" -uz "$mountpoint" 2>/dev/null || true
+                [ -n "$fusermount_bin" ] && "$fusermount_bin" -u "$mountpoint" 2>/dev/null || true
             fi
             echo "stopped $unit"
             exit 0
@@ -178,6 +201,10 @@ case "$cmd" in
         [ -n "$1" ] || { echo "Error: falta el identificador o nombre de unidad" >&2; exit 1; }
         encoded=$(normalize_encoded "$1")
         validate_encoded "$encoded"
+        if ! acquire_account_lock "$encoded"; then
+            echo "Error: la cuenta $encoded está ocupada por otra operación" >&2
+            exit 1
+        fi
         ensure_systemd_override
         unit="onedriver@${encoded}.service"
         if out=$(systemctl --user restart "$unit" 2>&1); then
@@ -192,6 +219,10 @@ case "$cmd" in
         [ -n "$1" ] || { echo "Error: falta el identificador o nombre de unidad" >&2; exit 1; }
         encoded=$(normalize_encoded "$1")
         validate_encoded "$encoded"
+        if ! acquire_account_lock "$encoded"; then
+            echo "Error: la cuenta $encoded está ocupada por otra operación" >&2
+            exit 1
+        fi
         unit="onedriver@${encoded}.service"
         if out=$(systemctl --user enable "$unit" 2>&1); then
             echo "enabled $unit"
@@ -205,6 +236,10 @@ case "$cmd" in
         [ -n "$1" ] || { echo "Error: falta el identificador o nombre de unidad" >&2; exit 1; }
         encoded=$(normalize_encoded "$1")
         validate_encoded "$encoded"
+        if ! acquire_account_lock "$encoded"; then
+            echo "Error: la cuenta $encoded está ocupada por otra operación" >&2
+            exit 1
+        fi
         unit="onedriver@${encoded}.service"
         if out=$(systemctl --user disable "$unit" 2>&1); then
             echo "disabled $unit"
@@ -218,6 +253,10 @@ case "$cmd" in
         [ -n "$1" ] || { echo "Error: falta el identificador o nombre de unidad" >&2; exit 1; }
         encoded=$(normalize_encoded "$1")
         validate_encoded "$encoded"
+        if ! acquire_account_lock "$encoded"; then
+            echo "Error: la cuenta $encoded está ocupada por otra operación" >&2
+            exit 1
+        fi
         unit="onedriver@${encoded}.service"
         state=$(systemctl --user is-enabled "$unit" 2>/dev/null || true)
         case "$state" in
@@ -262,10 +301,17 @@ case "$cmd" in
             } | sort -u
         )
         for u in $units; do
+            u_enc=$(normalize_encoded "$u")
+            if ! acquire_account_lock "$u_enc"; then
+                failed=1
+                failed_units="$failed_units $u(busy)"
+                continue
+            fi
             if ! systemctl --user start "$u" 2>&1; then
                 failed=1
                 failed_units="$failed_units $u"
             fi
+            release_account_lock
         done
         if [ "$failed" -eq 1 ]; then
             echo "Error al montar unidades:$failed_units" >&2
@@ -280,26 +326,31 @@ case "$cmd" in
         units=$(systemctl --user list-units --all --no-legend --no-pager 'onedriver@*.service' 2>/dev/null \
             | awk '$1 ~ /^onedriver@/ {print $1}')
         for u in $units; do
+            u_enc=$(normalize_encoded "$u")
+            if ! acquire_account_lock "$u_enc"; then
+                failed=1
+                failed_units="$failed_units $u(busy)"
+                continue
+            fi
             if ! systemctl --user stop "$u" 2>&1; then
                 failed=1
                 failed_units="$failed_units $u"
             fi
             if ! wait_unit_stopped "$u"; then
                 failed=1
-                failed_units="$failed_units $u"
+                failed_units="$failed_units $u(timeout)"
             fi
-            enc=${u#onedriver@}
-            enc=${enc%.service}
-            mp=$(systemd-escape --unescape --path "$enc" 2>/dev/null || true)
+            mp=$(systemd-escape --unescape --path "$u_enc" 2>/dev/null || true)
             if [ -n "$mp" ] && is_mounted "$mp"; then
                 fusermount_bin=$(command -v fusermount3 || command -v fusermount || true)
-                [ -n "$fusermount_bin" ] && "$fusermount_bin" -uz "$mp" 2>/dev/null || true
+                [ -n "$fusermount_bin" ] && "$fusermount_bin" -u "$mp" 2>/dev/null || true
                 sleep 0.2
                 if is_mounted "$mp"; then
                     failed=1
                     failed_units="$failed_units $u(fuse_busy)"
                 fi
             fi
+            release_account_lock
         done
         if [ "$failed" -eq 1 ]; then
             echo "Error al desmontar unidades:$failed_units" >&2
@@ -362,20 +413,26 @@ case "$cmd" in
 
         # 4. Verificar subidas pendientes en onedriver.db antes de purgar
         db_file="$cache_dir/$encoded/onedriver.db"
-        if [ -f "$db_file" ] && [ -s "$db_file" ]; then
-            has_pending=$(python3 -c "
-import sys, os
-sys.path.insert(0, '$script_dir/integrations/nautilus')
-sys.path.insert(0, os.path.expanduser('~/.local/share/nautilus-python/extensions'))
-try:
-    import onedrive_core
-    res = onedrive_core.read_bbolt_db(r'$db_file')
-    print('1' if res.get('has_pending_uploads') else '0')
-except Exception:
-    print('0')
-" 2>/dev/null || echo "0")
-            if [ "$has_pending" = "1" ]; then
-                echo "Error: la cuenta tiene subidas pendientes a OneDrive. No se puede vaciar la caché para evitar pérdida de datos locales." >&2
+        core_py="$script_dir/integrations/nautilus/onedrive_core.py"
+        if [ ! -f "$core_py" ]; then
+            core_py="${XDG_DATA_HOME:-$home_dir/.local/share}/nautilus-python/extensions/onedrive_core.py"
+        fi
+        if [ ! -f "$core_py" ]; then
+            echo "Error: no se encontró onedrive_core.py para verificar la seguridad del vaciado." >&2
+            if [ "$was_active" -eq 1 ]; then
+                systemctl --user start "$unit" 2>/dev/null || true
+            fi
+            exit 1
+        fi
+
+        if [ -f "$db_file" ]; then
+            purge_check_out=$(python3 "$core_py" check-purge "$db_file" 2>&1)
+            purge_check_rc=$?
+            if [ "$purge_check_rc" -ne 0 ] || [ "$purge_check_out" != "SAFE_TO_PURGE" ]; then
+                echo "Error: no es seguro vaciar la caché ($purge_check_out). Se cancela la operación para evitar pérdida de datos." >&2
+                if [ "$was_active" -eq 1 ]; then
+                    systemctl --user start "$unit" 2>/dev/null || true
+                fi
                 exit 1
             fi
         fi
@@ -434,12 +491,32 @@ except Exception:
             exit 1
         fi
 
-        # 2. Respaldo de seguridad en caso de haber cambios pendientes o datos en caché
-        if [ -d "$cache_dir/$encoded" ]; then
+        # 2. Respaldo de seguridad OBLIGATORIO antes de cualquier borrado
+        account_dir="$cache_dir/$encoded"
+        if [ -d "$account_dir" ]; then
             backup_base="${XDG_DATA_HOME:-$home_dir/.local/share}/onedrive-backup"
-            backup_dir="$backup_base/${encoded}_$(date +%Y%m%d_%H%M%S)"
-            mkdir -p "$backup_base" 2>/dev/null || true
-            cp -a "$cache_dir/$encoded" "$backup_dir" 2>/dev/null || true
+            backup_dir="$backup_base/${encoded}_$(date +%Y%m%d_%H%M%S)_$$"
+
+            if ! mkdir -p "$backup_base" 2>/dev/null || [ ! -d "$backup_base" ]; then
+                echo "Error: no se pudo crear el directorio de respaldo $backup_base. Operación abortada para proteger los datos." >&2
+                exit 1
+            fi
+            chmod 700 "$backup_base" 2>/dev/null || true
+
+            if ! cp -a "$account_dir" "$backup_dir" 2>/dev/null; then
+                rm -rf "$backup_dir" 2>/dev/null || true
+                echo "Error: falló la copia de seguridad en $backup_dir. Operación abortada; el directorio original no ha sido modificado." >&2
+                exit 1
+            fi
+            chmod 700 "$backup_dir" 2>/dev/null || true
+
+            if [ -f "$account_dir/auth_tokens.json" ] && [ ! -f "$backup_dir/auth_tokens.json" ]; then
+                rm -rf "$backup_dir" 2>/dev/null || true
+                echo "Error: verificación del respaldo falló (faltan archivos críticos). Operación abortada; no se eliminó la cuenta." >&2
+                exit 1
+            fi
+
+            echo "Respaldo de seguridad creado exitosamente en: $backup_dir"
         fi
 
         if ! systemctl --user disable "$unit" 2>/dev/null; then

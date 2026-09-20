@@ -284,10 +284,24 @@ Q_EOF
 }
 
 # Discover units from loaded units, enabled unit files, and systemd wants directory
-loaded_units=$(systemctl --user list-units --plain --all --no-legend --no-pager 'onedriver@*.service' 2>/dev/null \
+discovery_failed=0
+
+raw_loaded=$(systemctl --user list-units --plain --all --no-legend --no-pager 'onedriver@*.service' 2>&1)
+loaded_rc=$?
+if [ $loaded_rc -ne 0 ]; then
+    discovery_failed=1
+fi
+
+raw_unit_files=$(systemctl --user list-unit-files --no-legend --no-pager 'onedriver@*.service' 2>&1)
+files_rc=$?
+if [ $files_rc -ne 0 ]; then
+    discovery_failed=1
+fi
+
+loaded_units=$(printf '%s\n' "$raw_loaded" \
     | awk '{for(i=1;i<=NF;i++) if ($i ~ /^onedriver@.*\.service$/) {sub(/^onedriver@/, "", $i); sub(/\.service$/, "", $i); print $i; break}}')
 
-unit_files=$(systemctl --user list-unit-files --no-legend --no-pager 'onedriver@*.service' 2>/dev/null \
+unit_files=$(printf '%s\n' "$raw_unit_files" \
     | awk '$1 ~ /^onedriver@.*\.service$/ {sub(/^onedriver@/, "", $1); sub(/\.service$/, "", $1); print $1}')
 
 wants_dir="${XDG_CONFIG_HOME:-$home_dir/.config}/systemd/user/default.target.wants"
@@ -312,5 +326,10 @@ fi
 } | sed '/^[[:space:]]*$/d' \
   | sort -u \
   | while IFS= read -r encoded; do emit_mount "$encoded"; done
+
+if [ "$discovery_failed" -ne 0 ]; then
+    printf '#STATUS:ERROR\n'
+    exit 1
+fi
 
 printf '#STATUS:OK\n'

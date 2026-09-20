@@ -428,15 +428,32 @@ PluginComponent {
     function parseStatus(output) {
         const result = [];
         const previous = mounts.slice();
-        const hasStatusOk = (output || "").indexOf("#STATUS:OK") !== -1;
-        const lines = (output || "").trim().split("\n");
-        const nonEmptyLines = lines.filter(l => l.trim().length > 0 && !l.startsWith("#"));
+        const lines = (output || "").split(/\r?\n/);
+
+        let hasStatusOk = false;
+        let hasStatusError = false;
+        let malformedCount = 0;
+
         for (const line of lines) {
-            if (!line.trim() || line.startsWith("#"))
+            const trimmed = line.trim();
+            if (!trimmed)
                 continue;
+            if (trimmed === "#STATUS:OK") {
+                hasStatusOk = true;
+                continue;
+            }
+            if (trimmed === "#STATUS:ERROR") {
+                hasStatusError = true;
+                continue;
+            }
+            if (trimmed.startsWith("#"))
+                continue;
+
             const fields = line.split("\t");
-            if (fields.length !== 15)
+            if (fields.length !== 15) {
+                malformedCount++;
                 continue;
+            }
             result.push({
                 unit: fields[0],
                 encoded: fields[1],
@@ -455,14 +472,21 @@ PluginComponent {
                 cachedFilesCount: Number(fields[14] || 0)
             });
         }
-        if (nonEmptyLines.length > 0 && result.length === 0 && !hasStatusOk) {
-            root.lastError = "Salida del monitor incompleta o no válida (" + nonEmptyLines.length + " líneas descartadas)";
+
+        if (malformedCount > 0 || hasStatusError || !hasStatusOk) {
+            let errorMsg = "Error al consultar estado de OneDrive";
+            if (malformedCount > 0) {
+                errorMsg = "Salida del monitor corrupta (" + malformedCount + " fila(s) descartadas)";
+            } else if (hasStatusError) {
+                errorMsg = "Fallo en el servicio de descubrimiento de systemd";
+            } else if (!hasStatusOk) {
+                errorMsg = "Respuesta incompleta del monitor";
+            }
+            root.lastError = errorMsg;
+            // Retain previous snapshot so accounts do not silently disappear
             return;
         }
-        if (result.length === 0 && mounts.length > 0 && !hasStatusOk) {
-            // Transient empty output without completion marker: retain previous snapshot
-            return;
-        }
+
         root.lastError = "";
         result.sort((a, b) => (a.label || a.path).localeCompare(b.label || b.path));
         updateActivityHistory(result, previous);

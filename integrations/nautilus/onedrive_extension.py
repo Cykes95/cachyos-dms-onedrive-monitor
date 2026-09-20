@@ -44,6 +44,19 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
         self.last_mount_check = 0
         self.syncing_paths = set()
         self._refresh_mounts()
+        try:
+            GLib.timeout_add_seconds(5, self._periodic_check)
+        except Exception:
+            pass
+
+    def _periodic_check(self):
+        try:
+            self._refresh_mounts()
+            for mp, info in list(self.mounts.items()):
+                self._load_db_if_needed(info)
+        except Exception:
+            pass
+        return True
 
     def _refresh_mounts(self):
         now = time.monotonic()
@@ -90,6 +103,8 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                             "db_ready": False,
                             "loading_db": False,
                             "mtime": 0,
+                            "content_mtime": 0,
+                            "last_error_time": 0,
                             "txid": 0,
                             "pending_invalidation": set(),
                             "lock": threading.Lock()
@@ -100,47 +115,94 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
             if stale_mp not in discovered_mps:
                 del self.mounts[stale_mp]
 
-    def _load_db_if_needed(self, mount_info: dict, file_or_files=None):
+    def _load_db_if_needed(self, mount_info: dict, file_or_files=None, force=False):
         db_path = mount_info["db_path"]
         content_dir = mount_info["content_dir"]
 
         with mount_info["lock"]:
+            if not os.path.isfile(db_path) or os.path.getsize(db_path) == 0:
+                mount_info["db_ready"] = False
+                return
+
+            now = time.time()
+            if not force and (now - mount_info.get("last_error_time", 0) < 3.0):
+                # Backoff after recent error to prevent busy loops
+                return
+
+            try:
+                db_mtime = os.path.getmtime(db_path)
+            except OSError:
+                return
+
+            try:
+                content_mtime = os.path.getmtime(content_dir) if os.path.isdir(content_dir) else 0
+            except OSError:
+                content_mtime = 0
+
+            need_db_reload = force or (db_mtime > mount_info.get("mtime", 0)) or not mount_info.get("db_ready")
+            need_content_refresh = force or (content_mtime > mount_info.get("content_mtime", 0))
+
+            if not need_db_reload and not need_content_refresh:
+                return
+
+            if mount_info["loading_db"]:
+                # Only register interested FileInfo when a load is actively occurring
+                if file_or_files:
+                    if isinstance(file_or_files, (list, set, tuple)):
+                        mount_info["pending_invalidation"].update(f for f in file_or_files if isinstance(f, Nautilus.FileInfo))
+                    elif isinstance(file_or_files, Nautilus.FileInfo):
+                        mount_info["pending_invalidation"].add(file_or_files)
+                return
+
+            mount_info["loading_db"] = True
             if file_or_files:
                 if isinstance(file_or_files, (list, set, tuple)):
                     mount_info["pending_invalidation"].update(f for f in file_or_files if isinstance(f, Nautilus.FileInfo))
                 elif isinstance(file_or_files, Nautilus.FileInfo):
                     mount_info["pending_invalidation"].add(file_or_files)
 
-            if not os.path.isfile(db_path) or os.path.getsize(db_path) == 0:
-                mount_info["db_ready"] = False
-                return
-
-            try:
-                mtime = os.path.getmtime(db_path)
-            except OSError:
-                return
-
-            if mtime <= mount_info["mtime"] and mount_info["db_ready"]:
-                return
-
-            if mount_info["loading_db"]:
-                return
-
-            mount_info["loading_db"] = True
-
         def worker():
+            nonlocal need_db_reload, need_content_refresh
+            snapshot = None
+            error_occurred = False
+
             try:
-                snapshot = onedrive_core.read_bbolt_db(db_path, content_dir)
+                if need_db_reload:
+                    snapshot = onedrive_core.read_bbolt_db(db_path, content_dir)
+                    if not snapshot or not snapshot.get("read_success"):
+                        error_occurred = True
+                elif need_content_refresh:
+                    with mount_info["lock"]:
+                        current_snap = mount_info.get("snapshot")
+                    if current_snap and current_snap.get("read_success"):
+                        path_to_item = current_snap.get("path_to_item", {})
+                        known_folders = current_snap.get("known_folders", set())
+                        cache_status = onedrive_core.compute_cache_status(content_dir, path_to_item, known_folders)
+                        snapshot = dict(current_snap)
+                        snapshot.update(cache_status)
+                    else:
+                        snapshot = onedrive_core.read_bbolt_db(db_path, content_dir)
+                        if not snapshot or not snapshot.get("read_success"):
+                            error_occurred = True
             except Exception:
-                snapshot = None
+                error_occurred = True
 
             def apply_snapshot():
                 with mount_info["lock"]:
+                    if error_occurred:
+                        mount_info["last_error_time"] = time.time()
+                        mount_info["loading_db"] = False
+                        mount_info["pending_invalidation"].clear()
+                        return False
+
                     if snapshot and snapshot.get("read_success"):
                         mount_info["snapshot"] = snapshot
-                        mount_info["mtime"] = mtime
+                        mount_info["mtime"] = db_mtime
+                        mount_info["content_mtime"] = content_mtime
                         mount_info["txid"] = snapshot.get("txid", 0)
                         mount_info["db_ready"] = True
+                        mount_info["last_error_time"] = 0
+
                     mount_info["loading_db"] = False
                     to_invalidate = list(mount_info["pending_invalidation"])
                     mount_info["pending_invalidation"].clear()
@@ -393,17 +455,16 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                                 cid_f = item["id"] if item else None
                                 remote_size = item["size"] if item else 0
 
-                                if cid_f and onedrive_core.is_item_cached(content_dir, cid_f, remote_size):
-                                    already_cached += 1
-                                    continue
-
                                 with self._sync_lock:
                                     self.syncing_paths.add(fp)
                                 try:
                                     with open(fp, "rb") as f:
                                         while f.readinto(mv):
                                             pass
-                                    downloaded += 1
+                                    if cid_f and onedrive_core.is_item_cached(content_dir, cid_f, remote_size):
+                                        already_cached += 1
+                                    else:
+                                        downloaded += 1
                                 except Exception:
                                     failed += 1
                                 finally:
@@ -413,17 +474,16 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                         item = path_to_item.get(rel_path)
                         remote_size = item["size"] if item else 0
 
-                        if item_id and onedrive_core.is_item_cached(content_dir, item_id, remote_size):
-                            already_cached += 1
-                            continue
-
                         with self._sync_lock:
                             self.syncing_paths.add(file_path)
                         try:
                             with open(file_path, "rb") as f:
                                 while f.readinto(mv):
                                     pass
-                            downloaded += 1
+                            if item_id and onedrive_core.is_item_cached(content_dir, item_id, remote_size):
+                                already_cached += 1
+                            else:
+                                downloaded += 1
                         except Exception:
                             failed += 1
                         finally:
@@ -439,7 +499,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
 
                 # Re-check and update database snapshots for all involved mounts
                 for mi in mounts_involved.values():
-                    self._load_db_if_needed(mi)
+                    self._load_db_if_needed(mi, force=True)
 
                 for file, _, _, _, _, _, _, _ in targets_to_download:
                     try:

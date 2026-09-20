@@ -121,14 +121,14 @@ try:
                     cid = item["id"] if item else None
                     remote_size = item["size"] if item else 0
 
-                    if cid and onedrive_core.is_item_cached(content_dir, cid, remote_size):
-                        already_cached_count += 1
-                        continue
                     try:
                         with open(fp, "rb") as f:
                             while f.readinto(mv):
                                 pass
-                        downloaded_count += 1
+                        if cid and onedrive_core.is_item_cached(content_dir, cid, remote_size):
+                            already_cached_count += 1
+                        else:
+                            downloaded_count += 1
                     except Exception:
                         failed_count += 1
         else:
@@ -137,14 +137,14 @@ try:
             cid = item["id"] if item else None
             remote_size = item["size"] if item else 0
 
-            if cid and onedrive_core.is_item_cached(content_dir, cid, remote_size):
-                already_cached_count += 1
-                continue
             try:
                 with open(target, "rb") as f:
                     while f.readinto(mv):
                         pass
-                downloaded_count += 1
+                if cid and onedrive_core.is_item_cached(content_dir, cid, remote_size):
+                    already_cached_count += 1
+                else:
+                    downloaded_count += 1
             except Exception:
                 failed_count += 1
 finally:

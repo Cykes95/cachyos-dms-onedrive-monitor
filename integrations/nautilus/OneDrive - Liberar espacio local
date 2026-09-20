@@ -1,166 +1,26 @@
 #!/usr/bin/env python3
 """
 Nautilus Script: Liberar espacio local de OneDrive
-Permite seleccionar uno o varios archivos/carpetas en Nautilus y liberar su espacio local.
+Informa al usuario de forma segura que debe usar «Vaciar caché» desde el panel de OneDrive
+para proteger la integridad de datos y evitar inconsistencias o pérdidas de subidas pendientes.
 """
 
 import os
 import sys
 import subprocess
 
-# Add extensions directory to path to locate onedrive_core
-_ext_dir = os.path.expanduser("~/.local/share/nautilus-python/extensions")
-if _ext_dir not in sys.path:
-    sys.path.insert(0, _ext_dir)
-_local_dir = os.path.dirname(os.path.abspath(__file__))
-if _local_dir not in sys.path:
-    sys.path.insert(0, _local_dir)
-
-import onedrive_core
-
 raw_paths = os.environ.get("NAUTILUS_SCRIPT_SELECTED_FILE_PATHS", "")
 selected_paths = [p for p in raw_paths.splitlines() if p]
 if not selected_paths:
     selected_paths = [p for p in sys.argv[1:] if p]
 
-if not selected_paths:
-    sys.exit(0)
-
-cache_base = onedrive_core.get_cache_base()
-if not os.path.isdir(cache_base):
-    sys.exit(0)
-
-active_fuse_mounts = onedrive_core.get_active_fuse_mounts()
-
-# Match target mounts
-is_fuse_active = False
-for target in selected_paths:
-    for mp in active_fuse_mounts:
-        if target == mp or target.startswith(mp + "/"):
-            is_fuse_active = True
-            break
-    if is_fuse_active:
-        break
-
-# A2: Do not perform unsafe hot unlinks while onedriver FUSE daemon is active
-if is_fuse_active:
-    try:
-        subprocess.run([
-            "notify-send", "-a", "OneDrive", "-i", "dialog-information",
-            "OneDrive: Liberar espacio",
-            "onedriver está en ejecución. Para evitar inconsistencias con archivos abiertos, utilice «Vaciar caché» desde el panel de OneDrive."
-        ])
-    except Exception:
-        pass
-    sys.exit(0)
-
-# If the mount is stopped, perform safe maintenance under exclusive lock
-mounts = {}
 try:
-    entries = os.listdir(cache_base)
-except OSError:
-    entries = []
-
-for entry in entries:
-    if entry in ("CacheStorage", "WebKitCache"):
-        continue
-    cp = os.path.join(cache_base, entry)
-    token = os.path.join(cp, "auth_tokens.json")
-    if os.path.isdir(cp) and os.path.isfile(token):
-        try:
-            mp = onedrive_core.unescape_systemd(entry)
-            if os.path.isdir(mp):
-                mounts[mp] = {
-                    "cache_dir": cp,
-                    "content_dir": os.path.join(cp, "content"),
-                    "db_path": os.path.join(cp, "onedriver.db"),
-                    "encoded": entry
-                }
-        except Exception:
-            pass
-
-freed_count = 0
-locks = {}
-lock_failed = False
-
-try:
-    for target in selected_paths:
-        if not target:
-            continue
-
-        matched_mp = None
-        matched_info = None
-        for mp in sorted(mounts.keys(), key=len, reverse=True):
-            if target == mp or target.startswith(mp + "/"):
-                matched_mp = mp
-                matched_info = mounts[mp]
-                break
-
-        if not matched_mp:
-            continue
-
-        content_dir = matched_info["content_dir"]
-        db_path = matched_info["db_path"]
-        encoded = matched_info["encoded"]
-
-        if not os.path.isdir(content_dir) or not os.path.isfile(db_path):
-            continue
-
-        if encoded not in locks:
-            lf, ok = onedrive_core.acquire_lock(encoded, timeout=5.0)
-            if not ok:
-                lock_failed = True
-                break
-            locks[encoded] = lf
-
-        snapshot = onedrive_core.read_bbolt_db(db_path)
-        pending_uploads = snapshot.get("pending_upload_ids", set())
-        path_to_item = snapshot.get("path_to_item", {})
-
-        rel_path = os.path.relpath(target, matched_mp)
-        is_root = (rel_path == ".")
-        is_dir = is_root or os.path.isdir(target)
-        target_prefix = "" if is_root else (rel_path + "/")
-
-        for item_rel, item_info in path_to_item.items():
-            should_free = False
-            if is_root:
-                should_free = True
-            elif is_dir and item_rel.startswith(target_prefix):
-                should_free = True
-            elif not is_dir and item_rel == rel_path:
-                should_free = True
-
-            if should_free:
-                item_id = item_info["id"]
-                # A1: Never delete unuploaded files
-                if item_id in pending_uploads:
-                    continue
-
-                cached_file = os.path.join(content_dir, item_id)
-                if os.path.isfile(cached_file):
-                    try:
-                        os.remove(cached_file)
-                        freed_count += 1
-                    except Exception:
-                        pass
-finally:
-    for lf in locks.values():
-        onedrive_core.release_lock(lf)
-
-if lock_failed:
-    try:
-        subprocess.run(["notify-send", "-a", "OneDrive", "-i", "dialog-warning", "Espacio liberado", "La cuenta está ocupada por otra operación."])
-    except Exception:
-        pass
-    sys.exit(1)
-
-if freed_count > 0:
-    msg = f"Se ha liberado el espacio local de {freed_count} archivo(s)."
-else:
-    msg = "Los elementos seleccionados no ocupaban espacio local adicional."
-
-try:
-    subprocess.run(["notify-send", "-a", "OneDrive", "-i", "onedrive-custom-cloud", "Espacio liberado", msg])
+    subprocess.run([
+        "notify-send", "-a", "OneDrive", "-i", "dialog-information",
+        "OneDrive: Liberar espacio local",
+        "Para garantizar la integridad de los datos y evitar inconsistencias, utilice la opción «Vaciar caché» desde el panel de OneDrive."
+    ])
 except Exception:
     pass
+
+sys.exit(0)
