@@ -80,14 +80,14 @@ PluginComponent {
 
     function activityKind(mount) {
         const activity = ((mount && mount.activity) || "").toLowerCase();
-        if (/upload|subiendo|uploaded|upload completed/.test(activity))
-            return "upload";
-        if (/download|descargando|download completed/.test(activity))
-            return "download";
+        if (/error|failed|failure|falló|fatal/.test(activity))
+            return "error";
         if (/offline|read-only|solo lectura/.test(activity))
             return "offline";
-        if (/error|failed|failure|falló/.test(activity))
-            return "error";
+        if (/uploading|subiendo|\bupload\b(?!\s+(completed|finished|done|ok))/.test(activity) && !/uploaded|completed|finished/.test(activity))
+            return "upload";
+        if (/downloading|descargando|\bdownload\b(?!\s+(completed|finished|done|ok))/.test(activity) && !/downloaded|completed|finished/.test(activity))
+            return "download";
         return "idle";
     }
 
@@ -804,7 +804,7 @@ PluginComponent {
 
                                         // Row 3: Cache size and Cloud Quota
                                         Row {
-                                            visible: root.showCache || !!root.quotaText(mount)
+                                            visible: root.showCache && (Number(mount.cacheBytes || 0) > 0 || !!root.quotaText(mount))
                                             width: parent.width
                                             spacing: Theme.spacingS
 

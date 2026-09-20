@@ -9,13 +9,12 @@ OneDrive Nautilus Extension
 import os
 import re
 import time
-import urllib.parse
 import threading
 import subprocess
 import mmap
 import gi
 gi.require_version('Nautilus', '4.1')
-from gi.repository import Nautilus, GObject, Gio, GLib
+from gi.repository import Nautilus, GObject, GLib
 
 DB_PATTERN = re.compile(rb'\{"id":"([A-Za-z0-9!_-]+)","name":"([^"]+)".*?"parentReference":\{.*?"path":"([^"]*)"', re.DOTALL)
 
@@ -29,11 +28,25 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
     def __init__(self):
         super().__init__()
         self.cache_base = os.path.expanduser("~/.cache/onedriver")
-        self.mounts = {} # mountpoint -> {"cache_dir": ..., "db_path": ..., "content_dir": ..., "mtime": 0, "path_to_id": {}, "id_to_path": {}}
+        config_file = os.path.expanduser("~/.config/onedriver/config.yml")
+        if os.path.isfile(config_file):
+            try:
+                with open(config_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        if line.strip().startswith("cacheDir:"):
+                            val = line.split(":", 1)[1].strip()
+                            if val.startswith("~"):
+                                self.cache_base = os.path.expanduser(val)
+                            elif val.startswith("/"):
+                                self.cache_base = val
+                            break
+            except Exception:
+                pass
+
+        self.mounts = {} # mountpoint -> {"cache_dir": ..., "db_path": ..., "content_dir": ..., "mtime": 0, "path_to_id": {}, "id_to_path": {}, "io_lock": ...}
         self.last_mount_check = 0
         self.cached_ids = {} # mountpoint -> (set_of_ids, timestamp)
         self.syncing_paths = set()
-        self.download_lock = threading.Lock()
         self._refresh_mounts()
 
     def _unescape_systemd(self, encoded: str) -> str:
@@ -86,7 +99,8 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                         "content_dir": os.path.join(entry_path, "content"),
                         "mtime": prev.get("mtime", 0),
                         "path_to_id": prev.get("path_to_id", {}),
-                        "id_to_path": prev.get("id_to_path", {})
+                        "id_to_path": prev.get("id_to_path", {}),
+                        "io_lock": prev.get("io_lock") or threading.Lock()
                     }
         self.mounts = active_mounts
 
@@ -312,49 +326,66 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
 
     def _on_free_space_activate(self, menu_item, onedrive_files):
         def worker():
-            freed = 0
-            affected_mounts = set()
-            for file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded in onedrive_files:
-                content_dir = mount_info.get("content_dir")
-                path_to_id = mount_info.get("path_to_id", {})
-                if not content_dir or not os.path.isdir(content_dir):
-                    continue
+            mounts_involved = {}
+            for item in onedrive_files:
+                mi = item[3]
+                if mi:
+                    cd = mi.get("cache_dir")
+                    if cd and cd not in mounts_involved:
+                        mounts_involved[cd] = mi.get("io_lock") or threading.Lock()
 
-                affected_mounts.add(mount_info.get("cache_dir"))
+            acquired = []
+            for lock in mounts_involved.values():
+                lock.acquire()
+                acquired.append(lock)
 
-                if is_dir:
-                    cids = mount_info.get("folder_to_cids", {}).get(rel_path, [])
-                    for cid in cids:
-                        cf = os.path.join(content_dir, cid)
-                        if os.path.isfile(cf):
-                            try:
-                                os.remove(cf)
-                                freed += 1
-                            except Exception:
-                                pass
-                else:
-                    if item_id:
-                        cf = os.path.join(content_dir, item_id)
-                        if os.path.isfile(cf):
-                            try:
-                                os.remove(cf)
-                                freed += 1
-                            except Exception:
-                                pass
+            try:
+                freed = 0
+                affected_mounts = set()
+                for file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded in onedrive_files:
+                    content_dir = mount_info.get("content_dir")
+                    path_to_id = mount_info.get("path_to_id", {})
+                    if not content_dir or not os.path.isdir(content_dir):
+                        continue
 
-            # Clear cached IDs so next info update re-reads fresh directory state
-            for cd in affected_mounts:
-                if cd:
-                    self.cached_ids.pop(cd, None)
+                    affected_mounts.add(mount_info.get("cache_dir"))
 
-            for file, _, _, _, _, _, _, _ in onedrive_files:
-                try:
-                    GLib.idle_add(file.invalidate_extension_info)
-                except Exception:
-                    pass
+                    if is_dir:
+                        cids = mount_info.get("folder_to_cids", {}).get(rel_path, [])
+                        for cid in cids:
+                            cf = os.path.join(content_dir, cid)
+                            if os.path.isfile(cf):
+                                try:
+                                    os.remove(cf)
+                                    freed += 1
+                                except Exception:
+                                    pass
+                    else:
+                        if item_id:
+                            cf = os.path.join(content_dir, item_id)
+                            if os.path.isfile(cf):
+                                try:
+                                    os.remove(cf)
+                                    freed += 1
+                                except Exception:
+                                    pass
 
-            if freed > 0:
-                _notify("OneDrive: Espacio liberado", f"Se desalojaron {freed} archivo(s) del equipo sin eliminarlos de la nube.", "onedrive-custom-cloud")
+                # Clear cached IDs so next info update re-reads fresh directory state
+                for cd in affected_mounts:
+                    if cd:
+                        self.cached_ids.pop(cd, None)
+
+                for file, _, _, _, _, _, _, _ in onedrive_files:
+                    try:
+                        GLib.idle_add(file.invalidate_extension_info)
+                    except Exception:
+                        pass
+
+                if freed > 0:
+                    _notify("OneDrive: Espacio liberado", f"Se desalojaron {freed} archivo(s) del equipo sin eliminarlos de la nube.", "onedrive-custom-cloud")
+            finally:
+                for lock in reversed(acquired):
+                    lock.release()
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -373,49 +404,67 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                 pass
 
         def worker():
-            with self.download_lock:
-                downloaded = 0
-                affected_mounts = set()
-                buf = bytearray(1024 * 1024)
-                mv = memoryview(buf)
-                try:
-                    for file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded in targets_to_download:
-                        affected_mounts.add(mount_info.get("cache_dir"))
-                        if is_dir:
-                            for root_dir, _, filenames in os.walk(file_path):
-                                for fn in filenames:
-                                    fp = os.path.join(root_dir, fn)
-                                    try:
-                                        with open(fp, "rb") as f:
-                                            while f.readinto(mv):
-                                                pass
-                                        downloaded += 1
-                                    except Exception:
-                                        pass
-                        else:
-                            try:
-                                with open(file_path, "rb") as f:
-                                    while f.readinto(mv):
-                                        pass
-                                downloaded += 1
-                            except Exception:
-                                pass
-                finally:
-                    # 2. Clear syncing state and invalidate cache
-                    for file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded in targets_to_download:
-                        self.syncing_paths.discard(file_path)
+            mounts_involved = {}
+            for item in targets_to_download:
+                mi = item[3]
+                if mi:
+                    cd = mi.get("cache_dir")
+                    if cd and cd not in mounts_involved:
+                        mounts_involved[cd] = mi.get("io_lock") or threading.Lock()
 
-                    for cd in affected_mounts:
-                        if cd:
-                            self.cached_ids.pop(cd, None)
+            acquired = []
+            for lock in mounts_involved.values():
+                lock.acquire()
+                acquired.append(lock)
 
-                    for file, _, _, _, _, _, _, _ in targets_to_download:
+            downloaded = 0
+            affected_mounts = set()
+            buf = bytearray(1024 * 1024)
+            mv = memoryview(buf)
+            try:
+                for file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded in targets_to_download:
+                    affected_mounts.add(mount_info.get("cache_dir"))
+                    if is_dir:
+                        for root_dir, _, filenames in os.walk(file_path):
+                            for fn in filenames:
+                                fp = os.path.join(root_dir, fn)
+                                self.syncing_paths.add(fp)
+                                try:
+                                    with open(fp, "rb") as f:
+                                        while f.readinto(mv):
+                                            pass
+                                    downloaded += 1
+                                except Exception:
+                                    pass
+                                finally:
+                                    self.syncing_paths.discard(fp)
+                    else:
                         try:
-                            GLib.idle_add(file.invalidate_extension_info)
+                            with open(file_path, "rb") as f:
+                                while f.readinto(mv):
+                                    pass
+                            downloaded += 1
                         except Exception:
                             pass
+            finally:
+                # 2. Clear syncing state and invalidate cache
+                for file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded in targets_to_download:
+                    self.syncing_paths.discard(file_path)
 
-                    if downloaded > 0:
-                        _notify("OneDrive: Descarga completada", f"Se descargaron {downloaded} archivo(s) para uso sin conexión.", "onedrive-custom-synced")
+                for cd in affected_mounts:
+                    if cd:
+                        self.cached_ids.pop(cd, None)
+
+                for file, _, _, _, _, _, _, _ in targets_to_download:
+                    try:
+                        GLib.idle_add(file.invalidate_extension_info)
+                    except Exception:
+                        pass
+
+                for lock in reversed(acquired):
+                    lock.release()
+
+                if downloaded > 0:
+                    _notify("OneDrive: Descarga completada", f"Se descargaron {downloaded} archivo(s) para uso sin conexión.", "onedrive-custom-synced")
 
         threading.Thread(target=worker, daemon=True).start()

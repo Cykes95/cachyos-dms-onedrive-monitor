@@ -16,6 +16,21 @@ if not selected_paths or selected_paths == [""]:
     sys.exit(0)
 
 cache_base = os.path.expanduser("~/.cache/onedriver")
+config_file = os.path.expanduser("~/.config/onedriver/config.yml")
+if os.path.isfile(config_file):
+    try:
+        with open(config_file, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip().startswith("cacheDir:"):
+                    val = line.split(":", 1)[1].strip()
+                    if val.startswith("~"):
+                        cache_base = os.path.expanduser(val)
+                    elif val.startswith("/"):
+                        cache_base = val
+                    break
+    except Exception:
+        pass
+
 if not os.path.isdir(cache_base):
     sys.exit(0)
 

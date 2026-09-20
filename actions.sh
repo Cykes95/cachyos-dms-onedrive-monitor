@@ -43,6 +43,16 @@ normalize_encoded() {
     esac
 }
 
+validate_encoded() {
+    val="$1"
+    case "$val" in
+        */*|*..*|''|*[[:space:]]*)
+            echo "Error: identificador de cuenta no válido: $val" >&2
+            exit 1
+            ;;
+    esac
+}
+
 ensure_systemd_override() {
     systemd_override_dir="$home_dir/.config/systemd/user/onedriver@.service.d"
     if [ ! -f "$systemd_override_dir/override.conf" ]; then
@@ -132,34 +142,62 @@ case "$cmd" in
         esac
         ;;
     mount-all)
+        failed=0
+        failed_units=""
         if [ -d "$cache_dir" ]; then
             for d in "$cache_dir"/*; do
                 if [ -d "$d" ] && [ -f "$d/auth_tokens.json" ]; then
                     enc=$(basename "$d")
-                    systemctl --user start "onedriver@${enc}.service" 2>/dev/null || true
+                    u="onedriver@${enc}.service"
+                    if ! systemctl --user start "$u" 2>&1; then
+                        failed=1
+                        failed_units="$failed_units $u"
+                    fi
                 fi
             done
         fi
-        echo "mount-all triggered"
+        if [ "$failed" -eq 1 ]; then
+            echo "Error al montar unidades:$failed_units" >&2
+            exit 1
+        fi
+        echo "mount-all completed"
         exit 0
         ;;
     unmount-all)
+        failed=0
+        failed_units=""
         units=$(systemctl --user list-units --all --no-legend --no-pager 'onedriver@*.service' 2>/dev/null \
             | awk '$1 ~ /^onedriver@/ {print $1}')
         for u in $units; do
-            systemctl --user stop "$u" 2>/dev/null || true
+            if ! systemctl --user stop "$u" 2>&1; then
+                failed=1
+                failed_units="$failed_units $u"
+            fi
         done
+        if [ "$failed" -eq 1 ]; then
+            echo "Error al desmontar unidades:$failed_units" >&2
+            exit 1
+        fi
         echo "unmount-all completed"
         exit 0
         ;;
     clear-cache)
         encoded=$(normalize_encoded "$1")
+        validate_encoded "$encoded"
         unit="onedriver@${encoded}.service"
         was_active=0
         if [ "$(systemctl --user is-active "$unit" 2>/dev/null || true)" = "active" ]; then
             was_active=1
             systemctl --user stop "$unit" 2>/dev/null || true
-            sleep 0.5
+            for _ in 1 2 3 4 5 6 7 8 9 10; do
+                st=$(systemctl --user is-active "$unit" 2>/dev/null || true)
+                [ "$st" != "active" ] && [ "$st" != "deactivating" ] && break
+                sleep 0.2
+            done
+            if [ "$(systemctl --user is-active "$unit" 2>/dev/null || true)" = "active" ]; then
+                echo "Error: no se pudo detener $unit antes de vaciar la caché" >&2
+                exit 1
+            fi
         fi
         content_dir="$cache_dir/$encoded/content"
         if [ -d "$content_dir" ]; then
@@ -177,9 +215,15 @@ case "$cmd" in
         ;;
     remove-mount)
         encoded=$(normalize_encoded "$1")
+        validate_encoded "$encoded"
         unit="onedriver@${encoded}.service"
         mountpoint=$(systemd-escape --unescape --path "$encoded" 2>/dev/null || true)
         systemctl --user stop "$unit" 2>/dev/null || true
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            st=$(systemctl --user is-active "$unit" 2>/dev/null || true)
+            [ "$st" != "active" ] && [ "$st" != "deactivating" ] && break
+            sleep 0.2
+        done
         systemctl --user disable "$unit" 2>/dev/null || true
         if [ -n "$mountpoint" ] && command -v fusermount3 >/dev/null 2>&1; then
             fusermount3 -uz "$mountpoint" 2>/dev/null || true
@@ -188,6 +232,16 @@ case "$cmd" in
         rm -f /tmp/onedriver_*_"${encoded}.tmp" 2>/dev/null || true
         echo "removed mount $encoded"
         exit 0
+        ;;
+    open-cache)
+        if [ -d "$cache_dir" ]; then
+            xdg-open "$cache_dir" >/dev/null 2>&1 &
+            echo "cache opened"
+            exit 0
+        else
+            echo "cache directory not found: $cache_dir" >&2
+            exit 1
+        fi
         ;;
     open-launcher)
         if command -v onedriver-launcher >/dev/null 2>&1; then
@@ -292,7 +346,7 @@ case "$cmd" in
         exit 0
         ;;
     *)
-        echo "Usage: actions.sh {start|stop|restart|enable|disable|toggle-autostart|mount-all|unmount-all|clear-cache|remove-mount|open-launcher|install-nautilus|uninstall-nautilus|restart-nautilus|status-nautilus} [target]" >&2
+        echo "Usage: actions.sh {start|stop|restart|enable|disable|toggle-autostart|mount-all|unmount-all|clear-cache|remove-mount|open-cache|open-launcher|install-nautilus|uninstall-nautilus|restart-nautilus|status-nautilus} [target]" >&2
         exit 1
         ;;
 esac

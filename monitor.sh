@@ -91,14 +91,14 @@ PROP_EOF
 
     mounted=0
     if command -v findmnt >/dev/null 2>&1; then
-        if findmnt -rn -o TARGET "$mountpoint" >/dev/null 2>&1; then
+        if findmnt -rn -t fuse.onedriver,fuse -o TARGET "$mountpoint" >/dev/null 2>&1; then
             mounted=1
         fi
     elif [ -r /proc/mounts ] && grep -Fqs " $mountpoint " /proc/mounts; then
         mounted=1
     fi
 
-    # Optimization: Cache size lookup with mtime verification & 30-second TTL
+    # Optimization: Cache size lookup with mtime verification & 30-second TTL (max 300s TTL ceiling)
     cache_bytes=0
     cache_size_file="/tmp/onedriver_cache_${encoded}.tmp"
     cur_mtime=$(stat -c %Y "$cache_entry/content" 2>/dev/null || echo 0)
@@ -108,9 +108,12 @@ PROP_EOF
     if [ -r "$cache_size_file" ]; then
         read -r last_ts last_mtime last_db_sz cached_val < "$cache_size_file" 2>/dev/null || true
         if [ -n "$last_ts" ] && [ -n "$cached_val" ]; then
-            if [ "$((now - last_ts))" -lt 30 ] || { [ "$last_mtime" = "$cur_mtime" ] && [ "$last_db_sz" = "$cur_db_sz" ]; }; then
-                cache_bytes="$cached_val"
-                need_du=0
+            # Mandatory TTL ceiling: must recalculate after 300s regardless of mtime
+            if [ "$((now - last_ts))" -lt 300 ]; then
+                if [ "$((now - last_ts))" -lt 30 ] || { [ "$last_mtime" = "$cur_mtime" ] && [ "$last_db_sz" = "$cur_db_sz" ]; }; then
+                    cache_bytes="$cached_val"
+                    need_du=0
+                fi
             fi
         fi
     fi

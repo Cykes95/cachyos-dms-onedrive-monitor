@@ -132,8 +132,7 @@ PluginSettings {
                 iconName: "folder"
                 tooltipText: "Abrir carpeta de caché de onedriver"
                 onClicked: {
-                    const home = Quickshell.env("HOME") || "";
-                    Quickshell.execDetached(["xdg-open", home + "/.cache/onedriver"]);
+                    Quickshell.execDetached(["sh", settingsRoot.actionsPath, "open-cache"]);
                 }
             }
         }
