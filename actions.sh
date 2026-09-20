@@ -283,25 +283,31 @@ case "$cmd" in
                 exit 1
             fi
         fi
+        fusermount_bin=$(command -v fusermount3 || command -v fusermount || true)
         if [ -n "$mountpoint" ] && is_mounted "$mountpoint"; then
-            echo "Error: el punto de montaje $mountpoint sigue montado; no se puede vaciar la caché con seguridad" >&2
+            [ -n "$fusermount_bin" ] && "$fusermount_bin" -uz "$mountpoint" 2>/dev/null || true
+            sleep 0.2
+        fi
+        for _ in 1 2 3 4 5; do
+            if [ -n "$mountpoint" ] && is_mounted "$mountpoint"; then
+                sleep 0.2
+            else
+                break
+            fi
+        done
+        if [ -n "$mountpoint" ] && is_mounted "$mountpoint"; then
+            echo "Error: el punto de montaje $mountpoint sigue ocupado; no se puede vaciar la caché con seguridad" >&2
             exit 1
         fi
         content_dir="$cache_dir/$encoded/content"
         if [ -d "$content_dir" ]; then
-            find "$content_dir" -mindepth 1 -delete 2>/dev/null || rm -rf "$content_dir"/* 2>/dev/null || true
-            rem=$(find "$content_dir" -mindepth 1 2>/dev/null | head -n 1)
-            if [ -n "$rem" ]; then
-                echo "Error: no se pudieron eliminar todos los archivos de la caché: $content_dir" >&2
-                exit 1
-            fi
+            chmod -R u+w "$content_dir" 2>/dev/null || true
+            rm -rf "$content_dir" 2>/dev/null || true
+            mkdir -p "$content_dir" 2>/dev/null || true
+            chmod 700 "$content_dir" 2>/dev/null || true
         fi
-        # Remove onedriver.db to compact metadata and reset cache size completely
-        rm -f "$cache_dir/$encoded/onedriver.db" 2>/dev/null || true
-        if [ -f "$cache_dir/$encoded/onedriver.db" ]; then
-            echo "Error: no se pudo eliminar la base de datos de metadatos de caché" >&2
-            exit 1
-        fi
+        # Remove onedriver.db* to compact metadata and reset cache size completely
+        rm -f "$cache_dir/$encoded/onedriver.db"* 2>/dev/null || true
         # Reset all cached files so monitor immediately recalculates
         rm -f "$runtime_dir"/*_"${encoded}.tmp" /tmp/onedriver_*_"${encoded}.tmp" 2>/dev/null || true
         if [ "$was_active" -eq 1 ]; then

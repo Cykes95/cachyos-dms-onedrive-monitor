@@ -259,8 +259,9 @@ Q_EOF
             fi
         fi
         if [ "$read_act" -eq 1 ]; then
-            activity=$(journalctl --user -u "$unit" --since "5 minutes ago" -n 25 --no-pager --quiet -o cat 2>/dev/null \
-                | grep -Ei 'uploading|uploaded|download|offline|online|retry|failed|error' \
+            activity=$(journalctl --user -u "$unit" --since "5 minutes ago" -n 35 --no-pager --quiet -o cat 2>/dev/null \
+                | grep -v -Ei 'Configuration file not found|using defaults|Unimplemented opcode|exit-code|signal=TERMINATED' \
+                | grep -Ei 'Download completed|Downloading|Upload completed|Uploading|offline|online|Failed to unmount' \
                 | tail -n 1 \
                 | tr '\t\r\n' ' ' \
                 | sed -E 's/\x1B\[[0-9;]*[[:alpha:]]//g' \

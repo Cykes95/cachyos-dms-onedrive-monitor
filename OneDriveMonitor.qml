@@ -55,12 +55,59 @@ PluginComponent {
     }
 
     function isMountDegraded(mount) {
-        return Boolean(mount && mount.active === "active" && mount.mounted !== "1");
+        if (!mount) return false;
+        if (mount.active !== "active") return false;
+        if (mount.subState === "start" || mount.subState === "activating") return false;
+        return Boolean(mount.mounted !== "1" && !root.pendingUnits[mount.encoded]);
+    }
+
+    function displayLabel(mount) {
+        if (!mount) return "OneDrive";
+        if (mount.label && !mount.label.includes("@") && !mount.label.startsWith("/"))
+            return mount.label;
+        const folder = mount.path ? mount.path.split("/").filter(Boolean).pop() : "";
+        if (folder)
+            return folder;
+        return mount.label || mount.account || "OneDrive";
+    }
+
+    function formatActivity(rawText) {
+        if (!rawText) return "";
+        let t = String(rawText).replace(/[\r\n]+/g, " ").replace(/\s+/g, " ").trim();
+        if (/Configuration file not found|using defaults|Unimplemented opcode|exit-code|signal=TERMINATED/i.test(t))
+            return "";
+
+        // Check for download completed
+        let m = t.match(/Download completed!.*?name="([^"]+)"/i) || t.match(/Download completed!.*?name=([^\s]+)/i);
+        if (m) return "Descargado: " + m[1];
+
+        // Check for downloading
+        m = t.match(/Downloading.*?name="([^"]+)"/i) || t.match(/Downloading (?:file )?["']?([^"'\s]+)/i);
+        if (m) return "Descargando: " + m[1];
+
+        // Check for upload completed
+        m = t.match(/Upload completed!.*?name="([^"]+)"/i) || t.match(/Upload completed!.*?name=([^\s]+)/i);
+        if (m) return "Subido: " + m[1];
+
+        // Check for uploading
+        m = t.match(/Uploading.*?name="([^"]+)"/i) || t.match(/Uploading (?:file )?["']?([^"'\s]+)/i);
+        if (m) return "Subiendo: " + m[1];
+
+        if (/offline/i.test(t)) return "Modo sin conexión";
+        if (/online/i.test(t)) return "Conectado a la nube";
+        if (/failed to unmount/i.test(t)) return "Punto de montaje ocupado al desmontar";
+
+        // Clean up log prefix like "03:42:20 INF "
+        let clean = t.replace(/^\d\d:\d\d:\d\d\s+(ERR|WRN|INF|DBG)\s+/i, "");
+        if (clean.length > 45) {
+            clean = clean.substring(0, 45) + "…";
+        }
+        return clean;
     }
 
     readonly property int activeCount: mounts.filter(mount => mount.active === "active" && mount.mounted === "1").length
     readonly property int transferCount: mounts.filter(mount => activityKind(mount) === "upload" || activityKind(mount) === "download").length
-    readonly property bool hasProblem: mounts.some(mount => mount.active === "failed" || isMountDegraded(mount) || activityKind(mount) === "error" || activityKind(mount) === "offline")
+    readonly property bool hasProblem: mounts.some(mount => mount.active === "failed" || isMountDegraded(mount) || activityKind(mount) === "error")
     readonly property bool allActive: mounts.length > 0 && activeCount === mounts.length
 
     readonly property string summary: {
@@ -88,17 +135,24 @@ PluginComponent {
     }
 
     function activityKind(mount) {
-        const activity = ((mount && mount.activity) || "").toLowerCase();
-        if (/error|failed|failure|falló|fatal/.test(activity))
+        const raw = ((mount && mount.activity) || "").trim();
+        if (!raw) return "idle";
+        if (/Configuration file not found|using defaults|Unimplemented opcode|exit-code|signal=TERMINATED/i.test(raw))
+            return "idle";
+
+        const activity = raw.toLowerCase();
+        if (/failed to unmount/i.test(activity))
+            return "error";
+        if (/^(\d\d:\d\d:\d\d\s+)?err\b/.test(activity))
             return "error";
         if (/offline|read-only|solo lectura/.test(activity))
             return "offline";
-        if (/uploading|subiendo|\bupload\b(?!\s+(completed|finished|done|ok))/.test(activity) && !/uploaded|completed|finished/.test(activity))
-            return "upload";
-        if (/downloading|descargando|\bdownload\b(?!\s+(completed|finished|done|ok))/.test(activity) && !/downloaded|completed|finished/.test(activity))
-            return "download";
-        if (/uploaded|downloaded|completed|finished|sincronizado|descarga completada|subida completada/.test(activity))
+        if (/download completed|uploaded|sincronizado|subida completada|descarga completada/.test(activity))
             return "completed";
+        if (/uploading|subiendo|\bupload\b/.test(activity))
+            return "upload";
+        if (/downloading|descargando|\bdownload\b/.test(activity))
+            return "download";
         return "idle";
     }
 
@@ -143,16 +197,18 @@ PluginComponent {
         }
 
         if (isMountDegraded(mount))
-            return "Servicio activo · Montaje no disponible (requiere reinicio)";
+            return "Montaje no disponible";
         if (mount.active === "failed")
             return "Servicio con errores";
         if (mount.subState === "systemd_error")
             return "Error al comunicar con systemd";
+
+        const kind = activityKind(mount);
         if (kind === "offline")
             return "Sin conexión · solo lectura";
         if (mount.active === "active" && mount.mounted === "1") {
             if (kind === "upload") return "Subiendo cambios";
-            if (kind === "download") return "Descargando contenido";
+            if (kind === "download") return "Descargando";
             if (kind === "completed") return "Sincronizado";
             if (mount.subState && mount.subState !== "running") return mount.subState;
             return "Conectado";
@@ -226,16 +282,20 @@ PluginComponent {
         result.forEach(mount => {
             const old = previous.find(item => item.encoded === mount.encoded);
             const kind = activityKind(mount);
-            if (mount.activity && kind !== "idle" && (!old || old.activity !== mount.activity)) {
-                next.unshift({
-                    label: mount.label || mount.path,
-                    text: mount.activity,
-                    time: Qt.formatTime(new Date(), "hh:mm:ss"),
-                    kind: kind
-                });
+            const cleanText = formatActivity(mount.activity);
+            if (cleanText && kind !== "idle" && (!old || old.activity !== mount.activity)) {
+                const label = root.displayLabel(mount);
+                if (next.length === 0 || next[0].text !== cleanText || next[0].label !== label) {
+                    next.unshift({
+                        label: label,
+                        text: cleanText,
+                        time: Qt.formatTime(new Date(), "hh:mm"),
+                        kind: kind
+                    });
+                }
             }
         });
-        activityHistory = next.slice(0, 8);
+        activityHistory = next.slice(0, 4);
     }
 
     function notifyStateChangesCheck(result, previous) {
@@ -406,7 +466,7 @@ PluginComponent {
 
     Timer {
         id: refreshDelay
-        interval: 600
+        interval: 1500
         repeat: false
         onTriggered: root.refresh()
     }
@@ -830,7 +890,7 @@ PluginComponent {
 
                                                 StyledText {
                                                     width: parent.width
-                                                    text: mount.label || mount.path
+                                                    text: root.displayLabel(mount)
                                                     color: Theme.surfaceText
                                                     font.pixelSize: Theme.fontSizeMedium
                                                     font.weight: Font.DemiBold
@@ -840,32 +900,40 @@ PluginComponent {
 
                                                 Row {
                                                     width: parent.width
-                                                    spacing: Theme.spacingS
+                                                    spacing: Theme.spacingXS
 
-                                                    StyledText {
-                                                        text: root.mountStatus(mount)
-                                                        color: root.activityColor(mount)
-                                                        font.pixelSize: Theme.fontSizeSmall
-                                                        elide: Text.ElideRight
-                                                        anchors.verticalCenter: parent.verticalCenter
-                                                    }
-
-                                                    // Badge for Account Type placed next to Conectado / Estado
                                                     StyledRect {
                                                         radius: 4
                                                         color: mount.accountType === "work" ? Theme.primaryContainer : Theme.surfaceContainerHighest
                                                         implicitWidth: badgeText.implicitWidth + 8
-                                                        implicitHeight: 18
+                                                        implicitHeight: 16
                                                         anchors.verticalCenter: parent.verticalCenter
 
                                                         StyledText {
                                                             id: badgeText
                                                             anchors.centerIn: parent
-                                                            text: mount.accountType === "work" ? "Educación / Empresa" : "Personal"
+                                                            text: mount.accountType === "work" ? "Empresa/Edu" : "Personal"
                                                             color: mount.accountType === "work" ? Theme.primary : Theme.surfaceVariantText
                                                             font.pixelSize: Theme.fontSizeSmall - 2
                                                             font.weight: Font.Medium
                                                         }
+                                                    }
+
+                                                    StyledText {
+                                                        text: "·"
+                                                        color: Theme.surfaceVariantText
+                                                        font.pixelSize: Theme.fontSizeSmall
+                                                        anchors.verticalCenter: parent.verticalCenter
+                                                    }
+
+                                                    StyledText {
+                                                        text: root.mountStatus(mount)
+                                                        color: root.activityColor(mount)
+                                                        font.pixelSize: Theme.fontSizeSmall
+                                                        width: Math.max(50, parent.width - badgeText.implicitWidth - 24)
+                                                        elide: Text.ElideRight
+                                                        maximumLineCount: 1
+                                                        anchors.verticalCenter: parent.verticalCenter
                                                     }
                                                 }
                                             }
@@ -889,6 +957,7 @@ PluginComponent {
                                             color: Theme.surfaceVariantText
                                             font.pixelSize: Theme.fontSizeSmall - 1
                                             elide: Text.ElideMiddle
+                                            maximumLineCount: 1
                                         }
 
                                         // Row 3: Cache size and Cloud Quota
@@ -903,7 +972,7 @@ PluginComponent {
                                                     if (root.showCache) {
                                                         let cText = "Caché local: " + root.formatBytes(mount.cacheBytes);
                                                         if (mount.cachedFilesCount !== undefined && mount.cachedFilesCount >= 0) {
-                                                            cText += " (" + mount.cachedFilesCount + " " + (mount.cachedFilesCount === 1 ? "archivo descargado)" : "archivos descargados)");
+                                                            cText += " (" + mount.cachedFilesCount + " " + (mount.cachedFilesCount === 1 ? "archivo)" : "archivos)");
                                                         }
                                                         parts.push(cText);
                                                     }
@@ -917,28 +986,39 @@ PluginComponent {
                                                 font.pixelSize: Theme.fontSizeSmall
                                                 width: parent.width
                                                 elide: Text.ElideRight
+                                                maximumLineCount: 1
                                             }
                                         }
 
                                         // Row 4: Live Activity string if available
                                         Row {
-                                            visible: !!mount.activity
+                                            readonly property string formattedAct: root.formatActivity(mount.activity)
+                                            visible: !!formattedAct
                                             width: parent.width
                                             spacing: Theme.spacingXS
 
                                             DankIcon {
-                                                name: "sync"
+                                                name: {
+                                                    switch (root.activityKind(mount)) {
+                                                    case "upload": return "cloud_upload";
+                                                    case "download": return "cloud_download";
+                                                    case "completed": return "check_circle";
+                                                    case "error": return "error";
+                                                    default: return "sync";
+                                                    }
+                                                }
                                                 size: 14
-                                                color: Theme.primary
+                                                color: root.activityColor(mount)
                                                 anchors.verticalCenter: parent.verticalCenter
                                             }
 
                                             StyledText {
-                                                text: mount.activity
+                                                text: parent.formattedAct
                                                 color: Theme.surfaceVariantText
                                                 font.pixelSize: Theme.fontSizeSmall
-                                                width: parent.width - 20
+                                                width: parent.width - 24
                                                 elide: Text.ElideRight
+                                                maximumLineCount: 1
                                                 anchors.verticalCenter: parent.verticalCenter
                                             }
                                         }
@@ -1092,38 +1172,93 @@ PluginComponent {
                             width: cards.width
                             spacing: Theme.spacingXS
 
-                            StyledText {
-                                text: "Actividad reciente"
-                                color: Theme.surfaceText
-                                font.pixelSize: Theme.fontSizeMedium
-                                font.weight: Font.DemiBold
+                            Row {
+                                width: parent.width
+                                spacing: Theme.spacingXS
+
+                                DankIcon {
+                                    name: "history"
+                                    size: 16
+                                    color: Theme.surfaceVariantText
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+
+                                StyledText {
+                                    text: "Actividad reciente"
+                                    color: Theme.surfaceText
+                                    font.pixelSize: Theme.fontSizeMedium
+                                    font.weight: Font.DemiBold
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
                             }
 
-                            Repeater {
-                                model: root.activityHistory.slice(0, 4)
+                            StyledRect {
+                                width: parent.width
+                                radius: Theme.cornerRadius
+                                color: Theme.surfaceContainerHigh
+                                implicitHeight: activityCol.implicitHeight + (Theme.spacingS * 2)
 
-                                delegate: Item {
-                                    required property var modelData
-                                    width: cards.width
-                                    height: 28
+                                Column {
+                                    id: activityCol
+                                    anchors.left: parent.left
+                                    anchors.right: parent.right
+                                    anchors.top: parent.top
+                                    anchors.margins: Theme.spacingS
+                                    spacing: Theme.spacingXS
 
-                                    Row {
-                                        anchors.fill: parent
-                                        spacing: Theme.spacingS
+                                    Repeater {
+                                        model: root.activityHistory.slice(0, 4)
 
-                                        StyledText {
-                                            text: modelData.time
-                                            color: Theme.surfaceVariantText
-                                            font.pixelSize: Theme.fontSizeSmall
-                                            width: 48
-                                        }
+                                        delegate: Item {
+                                            id: actItem
+                                            required property var modelData
+                                            width: activityCol.width
+                                            height: 24
+                                            clip: true
 
-                                        StyledText {
-                                            text: modelData.label + " · " + modelData.text
-                                            color: Theme.surfaceText
-                                            font.pixelSize: Theme.fontSizeSmall
-                                            width: parent.width - 48 - Theme.spacingS
-                                            elide: Text.ElideRight
+                                            Row {
+                                                anchors.fill: parent
+                                                spacing: Theme.spacingS
+
+                                                DankIcon {
+                                                    name: {
+                                                        switch (modelData.kind) {
+                                                        case "upload": return "cloud_upload";
+                                                        case "download": return "cloud_download";
+                                                        case "completed": return "check_circle";
+                                                        case "error": return "error";
+                                                        default: return "sync";
+                                                        }
+                                                    }
+                                                    size: 14
+                                                    color: {
+                                                        switch (modelData.kind) {
+                                                        case "completed": return Theme.primary;
+                                                        case "error": return Theme.error;
+                                                        default: return Theme.primary;
+                                                        }
+                                                    }
+                                                    anchors.verticalCenter: parent.verticalCenter
+                                                }
+
+                                                StyledText {
+                                                    text: modelData.time
+                                                    color: Theme.surfaceVariantText
+                                                    font.pixelSize: Theme.fontSizeSmall - 1
+                                                    width: 38
+                                                    anchors.verticalCenter: parent.verticalCenter
+                                                }
+
+                                                StyledText {
+                                                    text: (root.mounts.length > 1 ? (modelData.label + " · ") : "") + modelData.text
+                                                    color: Theme.surfaceText
+                                                    font.pixelSize: Theme.fontSizeSmall
+                                                    width: parent.width - 14 - 38 - (Theme.spacingS * 2)
+                                                    elide: Text.ElideRight
+                                                    maximumLineCount: 1
+                                                    anchors.verticalCenter: parent.verticalCenter
+                                                }
+                                            }
                                         }
                                     }
                                 }
