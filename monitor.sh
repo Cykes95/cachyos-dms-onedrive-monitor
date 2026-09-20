@@ -48,44 +48,55 @@ emit_mount() {
     label_file="$mountpoint/.xdg-volume-info"
 
     label=""
-    if [ -r "$label_file" ]; then
-        while IFS= read -r line || [ -n "$line" ]; do
-            case "$line" in
-                Name=*) label="${line#Name=}"; break ;;
-            esac
-        done < "$label_file"
+    account=""
+    account_type="work"
+    meta_cache_file="$runtime_dir/meta_${encoded}.tmp"
+    if [ -r "$meta_cache_file" ]; then
+        IFS='	' read -r label account account_type < "$meta_cache_file" 2>/dev/null || true
     fi
 
-    account=""
-    if [ -r "$token_file" ]; then
-        while IFS= read -r line || [ -n "$line" ]; do
-            case "$line" in
-                *\"account\":*)
-                    account=${line#*\"account\":\"}
-                    account=${account%%\"*}
-                    break
+    if [ -z "$label" ] || [ -z "$account" ]; then
+        if [ -r "$label_file" ]; then
+            while IFS= read -r line || [ -n "$line" ]; do
+                case "$line" in
+                    Name=*) label="${line#Name=}"; break ;;
+                esac
+            done < "$label_file"
+        fi
+
+        if [ -r "$token_file" ]; then
+            while IFS= read -r line || [ -n "$line" ]; do
+                case "$line" in
+                    *\"account\":*)
+                        account=${line#*\"account\":\"}
+                        account=${account%%\"*}
+                        break
+                        ;;
+                esac
+            done < "$token_file"
+        fi
+
+        [ -n "$label" ] || label="$account"
+        [ -n "$label" ] || label="$mountpoint"
+
+        # Authoritative driveType lookup directly from onedriver.db (from Microsoft Graph API)
+        if [ -f "$cache_entry/onedriver.db" ]; then
+            dt=$(grep -m 1 -ao '"driveType":"[a-zA-Z]*"' "$cache_entry/onedriver.db" 2>/dev/null | head -n 1)
+            case "$dt" in
+                *personal*) account_type="personal" ;;
+                *business*) account_type="work" ;;
+            esac
+        else
+            case "$account" in
+                *@outlook.*|*@hotmail.*|*@live.*|*@msn.*|*@passport.*)
+                    account_type="personal"
                     ;;
             esac
-        done < "$token_file"
-    fi
+        fi
 
-    [ -n "$label" ] || label="$account"
-    [ -n "$label" ] || label="$mountpoint"
-
-    account_type="work"
-    # Authoritative driveType lookup directly from onedriver.db (from Microsoft Graph API)
-    if [ -f "$cache_entry/onedriver.db" ]; then
-        dt=$(grep -m 1 -ao '"driveType":"[a-zA-Z]*"' "$cache_entry/onedriver.db" 2>/dev/null | head -n 1)
-        case "$dt" in
-            *personal*) account_type="personal" ;;
-            *business*) account_type="work" ;;
-        esac
-    else
-        case "$account" in
-            *@outlook.*|*@hotmail.*|*@live.*|*@msn.*|*@passport.*)
-                account_type="personal"
-                ;;
-        esac
+        if [ -n "$label" ] && [ -n "$account" ]; then
+            printf '%s\t%s\t%s\n' "$label" "$account" "$account_type" > "$meta_cache_file" 2>/dev/null || true
+        fi
     fi
 
     # Optimization: Query ActiveState, SubState and UnitFileState in a single systemctl fork
