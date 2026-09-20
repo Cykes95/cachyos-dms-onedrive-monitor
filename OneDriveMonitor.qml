@@ -327,7 +327,8 @@ PluginComponent {
                 activity: fields[10] || "",
                 totalBytes: fields[11] || "0",
                 freeBytes: fields[12] || "0",
-                accountType: fields[13] || "work"
+                accountType: fields[13] || "work",
+                cachedFilesCount: Number(fields[14] || 0)
             });
         }
         result.sort((a, b) => (a.label || a.path).localeCompare(b.label || b.path));
@@ -764,7 +765,11 @@ PluginComponent {
                                                 text: {
                                                     let parts = [];
                                                     if (root.showCache) {
-                                                        parts.push("Caché local: " + root.formatBytes(mount.cacheBytes));
+                                                        let cText = "Caché local: " + root.formatBytes(mount.cacheBytes);
+                                                        if (mount.cachedFilesCount !== undefined && mount.cachedFilesCount >= 0) {
+                                                            cText += " (" + mount.cachedFilesCount + " " + (mount.cachedFilesCount === 1 ? "archivo descargado)" : "archivos descargados)");
+                                                        }
+                                                        parts.push(cText);
                                                     }
                                                     const q = root.quotaText(mount);
                                                     if (q) {

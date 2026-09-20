@@ -97,10 +97,15 @@ emit_mount() {
         | sed -E 's/\x1B\[[0-9;]*[[:alpha:]]//g' \
         | sed 's/[[:space:]][[:space:]]*/ /g')
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    cached_files_count=0
+    if [ -d "$cache_entry/content" ]; then
+        cached_files_count=$(find "$cache_entry/content" -maxdepth 1 -type f 2>/dev/null | wc -l || echo 0)
+    fi
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$unit" "$encoded" "$mountpoint" "$label" "$account" \
         "$active" "$sub_state" "$enabled" "$mounted" "$cache_bytes" \
-        "$activity" "$total_bytes" "$free_bytes" "$account_type"
+        "$activity" "$total_bytes" "$free_bytes" "$account_type" "$cached_files_count"
 }
 
 # Discover units from loaded units, enabled unit files, and systemd wants directory
