@@ -76,7 +76,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
 
     def _refresh_mounts(self):
         now = time.time()
-        if now - self.last_mount_check < 10 and self.mounts:
+        if now - self.last_mount_check < 10:
             return
         self.last_mount_check = now
 
@@ -103,6 +103,9 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                         "io_lock": prev.get("io_lock") or threading.Lock()
                     }
         self.mounts = active_mounts
+        # Prune cached_ids for any mount that was removed
+        active_cache_dirs = {m["cache_dir"] for m in active_mounts.values()}
+        self.cached_ids = {k: v for k, v in self.cached_ids.items() if k in active_cache_dirs}
 
     def _parse_db_file(self, db_path: str, mtime: float, mount_info: dict):
         try:
@@ -229,7 +232,8 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
             path_to_id = mount_info.get("path_to_id", {})
             item_id = path_to_id.get(rel_path)
 
-            if file_path in self.syncing_paths or (file.is_directory() and any(p.startswith(file_path + "/") for p in self.syncing_paths)):
+            is_syncing = any(file_path == p or file_path.startswith(p + "/") or (file.is_directory() and p.startswith(file_path + "/")) for p in self.syncing_paths)
+            if is_syncing:
                 file.add_emblem("onedrive-custom-syncing")
                 return Nautilus.OperationResult.COMPLETE
 
@@ -284,14 +288,19 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
 
             is_downloaded = False
             if is_dir:
-                is_downloaded = rel_path in mount_info.get("cached_folders", set())
+                in_cached = rel_path in mount_info.get("cached_folders", set())
+                in_cloud = rel_path in mount_info.get("cloud_folders", set())
+                if in_cached:
+                    has_synced = True
+                if in_cloud:
+                    has_cloud = True
+                is_downloaded = in_cached and not in_cloud
             else:
                 is_downloaded = bool(item_id and item_id in cached_ids)
-
-            if is_downloaded:
-                has_synced = True
-            else:
-                has_cloud = True
+                if is_downloaded:
+                    has_synced = True
+                else:
+                    has_cloud = True
 
             onedrive_files.append((file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded))
 
@@ -335,7 +344,8 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                         mounts_involved[cd] = mi.get("io_lock") or threading.Lock()
 
             acquired = []
-            for lock in mounts_involved.values():
+            for cd in sorted(mounts_involved.keys()):
+                lock = mounts_involved[cd]
                 lock.acquire()
                 acquired.append(lock)
 
@@ -390,8 +400,11 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_download_activate(self, menu_item, onedrive_files):
-        # Filter out targets that are already actively syncing to prevent duplicate downloads
-        targets_to_download = [f for f in onedrive_files if f[1] not in self.syncing_paths]
+        # Filter out targets that are already actively syncing (or within a syncing directory)
+        targets_to_download = [
+            f for f in onedrive_files
+            if not any(f[1] == p or f[1].startswith(p + "/") for p in self.syncing_paths)
+        ]
         if not targets_to_download:
             return
 
@@ -413,7 +426,8 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                         mounts_involved[cd] = mi.get("io_lock") or threading.Lock()
 
             acquired = []
-            for lock in mounts_involved.values():
+            for cd in sorted(mounts_involved.keys()):
+                lock = mounts_involved[cd]
                 lock.acquire()
                 acquired.append(lock)
 

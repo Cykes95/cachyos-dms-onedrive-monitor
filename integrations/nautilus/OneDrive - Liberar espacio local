@@ -79,6 +79,27 @@ for name in os.listdir(cache_base):
             pass
 
 pattern = re.compile(rb'\{"id":"([A-Za-z0-9!_-]+)","name":"([^"]+)".*?"parentReference":\{.*?"path":"([^"]*)"', re.DOTALL)
+db_cache = {}
+
+def get_db_items(db_path):
+    if db_path in db_cache:
+        return db_cache[db_path]
+    items = []
+    try:
+        with open(db_path, "rb") as f:
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                matches = pattern.findall(mm)
+        for item_id_b, name_b, parent_b in matches:
+            clean_parent = parent_b.decode("utf-8", errors="ignore").replace("/drive/root:", "")
+            clean_name = name_b.decode("utf-8", errors="ignore")
+            item_rel = os.path.normpath(os.path.join(clean_parent.lstrip("/"), clean_name))
+            item_id = item_id_b.decode("utf-8", errors="ignore")
+            items.append((item_id, item_rel))
+    except Exception:
+        pass
+    db_cache[db_path] = items
+    return items
+
 freed_count = 0
 
 for target in selected_paths:
@@ -107,36 +128,25 @@ for target in selected_paths:
     if rel_path == ".":
         continue
 
-    try:
-        with open(db_path, "rb") as f:
-            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                matches = pattern.findall(mm)
+    db_items = get_db_items(db_path)
+    is_dir = os.path.isdir(target)
+    target_prefix = rel_path + "/"
 
-        is_dir = os.path.isdir(target)
-        target_prefix = rel_path + "/"
+    for item_id, item_rel in db_items:
+        should_free = False
+        if is_dir and item_rel.startswith(target_prefix):
+            should_free = True
+        elif not is_dir and item_rel == rel_path:
+            should_free = True
 
-        for item_id_b, name_b, parent_b in matches:
-            clean_parent = parent_b.decode("utf-8", errors="ignore").replace("/drive/root:", "")
-            clean_name = name_b.decode("utf-8", errors="ignore")
-            item_rel = os.path.normpath(os.path.join(clean_parent.lstrip("/"), clean_name))
-
-            should_free = False
-            if is_dir and item_rel.startswith(target_prefix):
-                should_free = True
-            elif not is_dir and item_rel == rel_path:
-                should_free = True
-
-            if should_free:
-                item_id = item_id_b.decode("utf-8", errors="ignore")
-                cached_file = os.path.join(content_dir, item_id)
-                if os.path.isfile(cached_file):
-                    try:
-                        os.remove(cached_file)
-                        freed_count += 1
-                    except Exception:
-                        pass
-    except Exception:
-        pass
+        if should_free:
+            cached_file = os.path.join(content_dir, item_id)
+            if os.path.isfile(cached_file):
+                try:
+                    os.remove(cached_file)
+                    freed_count += 1
+                except Exception:
+                    pass
 
 if freed_count > 0:
     msg = f"Se ha liberado el espacio local de {freed_count} archivo(s)."

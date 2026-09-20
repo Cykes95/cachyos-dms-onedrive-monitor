@@ -88,6 +88,8 @@ PluginComponent {
             return "upload";
         if (/downloading|descargando|\bdownload\b(?!\s+(completed|finished|done|ok))/.test(activity) && !/downloaded|completed|finished/.test(activity))
             return "download";
+        if (/uploaded|downloaded|completed|finished|sincronizado|descarga completada|subida completada/.test(activity))
+            return "completed";
         return "idle";
     }
 
@@ -95,6 +97,7 @@ PluginComponent {
         switch (activityKind(mount)) {
         case "upload": return "cloud_upload";
         case "download": return "cloud_download";
+        case "completed": return "cloud_done";
         case "offline": return "cloud_off";
         case "error": return "error_outline";
         default:
@@ -109,6 +112,7 @@ PluginComponent {
         switch (activityKind(mount)) {
         case "upload":
         case "download": return Theme.primary;
+        case "completed": return Theme.success;
         case "offline": return Theme.warning;
         case "error": return Theme.error;
         default: return mount && mount.active === "active" && mount.mounted === "1" ? Theme.success : Theme.surfaceVariantText;
@@ -135,6 +139,7 @@ PluginComponent {
         if (mount.active === "active" && mount.mounted === "1") {
             if (kind === "upload") return "Subiendo cambios";
             if (kind === "download") return "Descargando contenido";
+            if (kind === "completed") return "Sincronizado";
             if (mount.subState && mount.subState !== "running") return mount.subState;
             return "Conectado";
         }
@@ -240,6 +245,7 @@ PluginComponent {
         if (refreshInFlight || !monitorPath)
             return;
         refreshInFlight = true;
+        watchdogTimer.restart();
         monitorProcess.running = true;
     }
 
@@ -374,9 +380,20 @@ PluginComponent {
         onTriggered: root.refresh()
     }
 
+    Timer {
+        id: watchdogTimer
+        interval: 8000
+        repeat: false
+        onTriggered: {
+            if (root.refreshInFlight) {
+                root.refreshInFlight = false;
+            }
+        }
+    }
+
     Process {
         id: monitorProcess
-        command: root.monitorPath ? ["sh", root.monitorPath] : ["true"]
+        command: root.monitorPath ? (root.showCache ? ["sh", root.monitorPath] : ["sh", root.monitorPath, "--no-cache"]) : ["true"]
 
         stdout: StdioCollector {
             id: monitorOutput
@@ -389,6 +406,7 @@ PluginComponent {
         }
 
         onExited: exitCode => {
+            watchdogTimer.stop();
             root.refreshInFlight = false;
             if (exitCode === 0) {
                 root.lastError = "";
@@ -504,7 +522,12 @@ PluginComponent {
         }
     }
 
-    ccWidgetIcon: "cloud_sync"
+    ccWidgetIcon: {
+        if (root.hasProblem) return "cloud_alert";
+        if (root.transferCount > 0) return "cloud_sync";
+        if (root.activeCount > 0) return "cloud_done";
+        return "cloud_off";
+    }
     ccWidgetPrimaryText: "OneDrive"
     ccWidgetSecondaryText: root.summary
     ccWidgetIsActive: root.activeCount > 0

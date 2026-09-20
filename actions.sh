@@ -8,9 +8,13 @@ config_file="$home_dir/.config/onedriver/config.yml"
 cache_dir="$home_dir/.cache/onedriver"
 script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 
+runtime_dir="${XDG_RUNTIME_DIR:-/tmp}/onedriver_dms"
+mkdir -p "$runtime_dir" 2>/dev/null || runtime_dir="/tmp"
+
 if [ -r "$config_file" ]; then
     configured_cache=$(sed -n 's/^[[:space:]]*cacheDir:[[:space:]]*//p' "$config_file" | head -n 1)
     configured_cache=${configured_cache%"\r"}
+    configured_cache=$(printf '%s' "$configured_cache" | tr -d "\"'" )
     case "$configured_cache" in
         "~") cache_dir="$home_dir" ;;
         "~/"*) cache_dir="$home_dir/${configured_cache#~/}" ;;
@@ -54,20 +58,21 @@ validate_encoded() {
 }
 
 ensure_systemd_override() {
+    fusermount_bin=$(command -v fusermount3 || command -v fusermount || echo /usr/bin/fusermount3)
     systemd_override_dir="$home_dir/.config/systemd/user/onedriver@.service.d"
     if [ ! -f "$systemd_override_dir/override.conf" ]; then
         mkdir -p "$systemd_override_dir" 2>/dev/null || true
-        printf '[Service]\nExecStopPost=\nExecStopPost=-/usr/bin/fusermount3 -uz /%%I\n' > "$systemd_override_dir/override.conf" 2>/dev/null || true
+        printf '[Service]\nExecStopPost=\nExecStopPost=-%s -uz /%%I\n' "$fusermount_bin" > "$systemd_override_dir/override.conf" 2>/dev/null || true
         systemctl --user daemon-reload 2>/dev/null || true
     fi
 }
 
 cmd="$1"
 shift 1 2>/dev/null || true
-ensure_systemd_override
 
 case "$cmd" in
     start)
+        ensure_systemd_override
         unit=$(normalize_unit "$1")
         if out=$(systemctl --user start "$unit" 2>&1); then
             echo "started $unit"
@@ -88,6 +93,7 @@ case "$cmd" in
         fi
         ;;
     restart)
+        ensure_systemd_override
         unit=$(normalize_unit "$1")
         if out=$(systemctl --user restart "$unit" 2>&1); then
             echo "restarted $unit"
@@ -142,6 +148,7 @@ case "$cmd" in
         esac
         ;;
     mount-all)
+        ensure_systemd_override
         failed=0
         failed_units=""
         if [ -d "$cache_dir" ]; then
@@ -206,9 +213,12 @@ case "$cmd" in
         # Remove onedriver.db to compact metadata and reset cache size completely
         rm -f "$cache_dir/$encoded/onedriver.db" 2>/dev/null || true
         # Reset all cached files so monitor immediately recalculates
-        rm -f /tmp/onedriver_*_"${encoded}.tmp" 2>/dev/null || true
+        rm -f "$runtime_dir"/*_"${encoded}.tmp" /tmp/onedriver_*_"${encoded}.tmp" 2>/dev/null || true
         if [ "$was_active" -eq 1 ]; then
-            systemctl --user start "$unit" 2>/dev/null || true
+            if ! systemctl --user start "$unit" 2>/dev/null; then
+                echo "Advertencia: no se pudo reiniciar $unit tras vaciar la caché" >&2
+                exit 1
+            fi
         fi
         echo "cache cleared for $encoded"
         exit 0
@@ -224,12 +234,17 @@ case "$cmd" in
             [ "$st" != "active" ] && [ "$st" != "deactivating" ] && break
             sleep 0.2
         done
+        if [ "$(systemctl --user is-active "$unit" 2>/dev/null || true)" = "active" ]; then
+            echo "Error: no se pudo detener $unit antes de desvincular" >&2
+            exit 1
+        fi
         systemctl --user disable "$unit" 2>/dev/null || true
-        if [ -n "$mountpoint" ] && command -v fusermount3 >/dev/null 2>&1; then
-            fusermount3 -uz "$mountpoint" 2>/dev/null || true
+        fusermount_bin=$(command -v fusermount3 || command -v fusermount || true)
+        if [ -n "$mountpoint" ] && [ -n "$fusermount_bin" ]; then
+            "$fusermount_bin" -uz "$mountpoint" 2>/dev/null || true
         fi
         rm -rf "$cache_dir/$encoded" 2>/dev/null || true
-        rm -f /tmp/onedriver_*_"${encoded}.tmp" 2>/dev/null || true
+        rm -f "$runtime_dir"/*_"${encoded}.tmp" /tmp/onedriver_*_"${encoded}.tmp" 2>/dev/null || true
         echo "removed mount $encoded"
         exit 0
         ;;
@@ -302,10 +317,7 @@ case "$cmd" in
         fi
 
         # Ensure systemd user drop-in exists so onedriver unmount quirks never show as failures
-        if [ ! -f "$systemd_override_dir/override.conf" ]; then
-            printf '[Service]\nExecStopPost=\nExecStopPost=-/usr/bin/fusermount3 -uz /%%I\n' > "$systemd_override_dir/override.conf" 2>/dev/null || true
-            systemctl --user daemon-reload 2>/dev/null || true
-        fi
+        ensure_systemd_override
 
         case "$1" in
             --restart|-r)

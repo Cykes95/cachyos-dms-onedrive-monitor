@@ -5,12 +5,21 @@
 # Output is tab-separated and intentionally contains no credentials or tokens.
 
 home_dir=${HOME:-$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)}
-config_file="$home_dir/.config/onedriver/config.yml"
-cache_dir="$home_dir/.cache/onedriver"
+config_file="${XDG_CONFIG_HOME:-$home_dir/.config}/onedriver/config.yml"
+cache_dir="${XDG_CACHE_HOME:-$home_dir/.cache}/onedriver"
+runtime_dir="${XDG_RUNTIME_DIR:-/tmp}/onedriver_dms"
+mkdir -p "$runtime_dir" 2>/dev/null || runtime_dir="/tmp"
+
+skip_cache_calc=0
+for arg in "$@"; do
+    case "$arg" in
+        --no-cache) skip_cache_calc=1 ;;
+    esac
+done
 
 if [ -r "$config_file" ]; then
     configured_cache=$(sed -n 's/^[[:space:]]*cacheDir:[[:space:]]*//p' "$config_file" | head -n 1)
-    configured_cache=${configured_cache%"\r"}
+    configured_cache=$(printf '%s' "$configured_cache" | tr -d "\"'" )
     case "$configured_cache" in
         "~") cache_dir="$home_dir" ;;
         "~/"*) cache_dir="$home_dir/${configured_cache#~/}" ;;
@@ -64,11 +73,20 @@ emit_mount() {
     [ -n "$label" ] || label="$mountpoint"
 
     account_type="work"
-    case "$account" in
-        *@outlook.*|*@hotmail.*|*@live.*|*@msn.*|*@passport.*)
-            account_type="personal"
-            ;;
-    esac
+    # Authoritative driveType lookup directly from onedriver.db (from Microsoft Graph API)
+    if [ -f "$cache_entry/onedriver.db" ]; then
+        dt=$(grep -m 1 -ao '"driveType":"[a-zA-Z]*"' "$cache_entry/onedriver.db" 2>/dev/null | head -n 1)
+        case "$dt" in
+            *personal*) account_type="personal" ;;
+            *business*) account_type="work" ;;
+        esac
+    else
+        case "$account" in
+            *@outlook.*|*@hotmail.*|*@live.*|*@msn.*|*@passport.*)
+                account_type="personal"
+                ;;
+        esac
+    fi
 
     # Optimization: Query ActiveState, SubState and UnitFileState in a single systemctl fork
     active="inactive"
@@ -98,65 +116,88 @@ PROP_EOF
         mounted=1
     fi
 
-    # Optimization: Cache size lookup with mtime verification & 30-second TTL (max 300s TTL ceiling)
     cache_bytes=0
-    cache_size_file="/tmp/onedriver_cache_${encoded}.tmp"
-    cur_mtime=$(stat -c %Y "$cache_entry/content" 2>/dev/null || echo 0)
-    cur_db_sz=$(stat -c %s "$cache_entry/onedriver.db" 2>/dev/null || echo 0)
-    need_du=1
+    total_bytes=0
+    free_bytes=0
+    cached_files_count=0
 
-    if [ -r "$cache_size_file" ]; then
-        read -r last_ts last_mtime last_db_sz cached_val < "$cache_size_file" 2>/dev/null || true
-        if [ -n "$last_ts" ] && [ -n "$cached_val" ]; then
-            # Mandatory TTL ceiling: must recalculate after 300s regardless of mtime
-            if [ "$((now - last_ts))" -lt 300 ]; then
-                if [ "$((now - last_ts))" -lt 30 ] || { [ "$last_mtime" = "$cur_mtime" ] && [ "$last_db_sz" = "$cur_db_sz" ]; }; then
-                    cache_bytes="$cached_val"
-                    need_du=0
+    if [ "$skip_cache_calc" -eq 0 ]; then
+        # Optimization: Cache size lookup with mtime verification & 30-second TTL (max 300s TTL ceiling)
+        cache_size_file="$runtime_dir/cache_${encoded}.tmp"
+        cur_mtime=$(stat -c %Y "$cache_entry/content" 2>/dev/null || echo 0)
+        cur_db_sz=$(stat -c %s "$cache_entry/onedriver.db" 2>/dev/null || echo 0)
+        need_du=1
+
+        if [ -r "$cache_size_file" ]; then
+            read -r last_ts last_mtime last_db_sz cached_val < "$cache_size_file" 2>/dev/null || true
+            if [ -n "$last_ts" ] && [ -n "$cached_val" ]; then
+                # Mandatory TTL ceiling: must recalculate after 300s regardless of mtime
+                if [ "$((now - last_ts))" -lt 300 ]; then
+                    if [ "$((now - last_ts))" -lt 30 ] || { [ "$last_mtime" = "$cur_mtime" ] && [ "$last_db_sz" = "$cur_db_sz" ]; }; then
+                        cache_bytes="$cached_val"
+                        need_du=0
+                    fi
                 fi
             fi
         fi
-    fi
-    if [ "$need_du" -eq 1 ] && [ -d "$cache_entry" ]; then
-        cache_bytes=$(du -sb "$cache_entry" 2>/dev/null | awk 'NR == 1 {print $1}')
-        case "$cache_bytes" in
-            ''|*[!0-9]*) cache_bytes=0 ;;
-            *) printf '%s %s %s %s\n' "$now" "$cur_mtime" "$cur_db_sz" "$cache_bytes" > "$cache_size_file" 2>/dev/null || true ;;
-        esac
-    fi
-
-    # Optimization: Single stat -f call with 60-second TTL
-    total_bytes=0
-    free_bytes=0
-    if [ "$mounted" -eq 1 ]; then
-        quota_cache_file="/tmp/onedriver_quota_${encoded}.tmp"
-        read_quota=1
-        if [ -r "$quota_cache_file" ]; then
-            read -r q_ts q_tot q_free < "$quota_cache_file" 2>/dev/null || true
-            if [ -n "$q_ts" ] && [ "$((now - q_ts))" -lt 60 ] && [ -n "$q_tot" ]; then
-                total_bytes="$q_tot"
-                free_bytes="$q_free"
-                read_quota=0
-            fi
+        if [ "$need_du" -eq 1 ] && [ -d "$cache_entry" ]; then
+            cache_bytes=$(du -sb "$cache_entry" 2>/dev/null | awk 'NR == 1 {print $1}')
+            case "$cache_bytes" in
+                ''|*[!0-9]*) cache_bytes=0 ;;
+                *) printf '%s %s %s %s\n' "$now" "$cur_mtime" "$cur_db_sz" "$cache_bytes" > "$cache_size_file" 2>/dev/null || true ;;
+            esac
         fi
-        if [ "$read_quota" -eq 1 ]; then
-            quota_stats=$(stat -f -c '%S %b %a' "$mountpoint" 2>/dev/null || echo "0 0 0")
-            read -r q_s q_b q_a <<Q_EOF
+
+        # Optimization: Single stat -f call with 60-second TTL
+        if [ "$mounted" -eq 1 ]; then
+            quota_cache_file="$runtime_dir/quota_${encoded}.tmp"
+            read_quota=1
+            if [ -r "$quota_cache_file" ]; then
+                read -r q_ts q_tot q_free < "$quota_cache_file" 2>/dev/null || true
+                if [ -n "$q_ts" ] && [ "$((now - q_ts))" -lt 60 ] && [ -n "$q_tot" ]; then
+                    total_bytes="$q_tot"
+                    free_bytes="$q_free"
+                    read_quota=0
+                fi
+            fi
+            if [ "$read_quota" -eq 1 ]; then
+                quota_stats=$(stat -f -c '%S %b %a' "$mountpoint" 2>/dev/null || echo "0 0 0")
+                read -r q_s q_b q_a <<Q_EOF
 $quota_stats
 Q_EOF
-            case "$q_s:$q_b:$q_a" in
-                *[!0-9:]*|:*|*::*) total_bytes=0; free_bytes=0 ;;
-                *) total_bytes=$((q_s * q_b)); free_bytes=$((q_s * q_a))
-                   printf '%s %s %s\n' "$now" "$total_bytes" "$free_bytes" > "$quota_cache_file" 2>/dev/null || true
-                   ;;
-            esac
+                case "$q_s:$q_b:$q_a" in
+                    *[!0-9:]*|:*|*::*) total_bytes=0; free_bytes=0 ;;
+                    *) total_bytes=$((q_s * q_b)); free_bytes=$((q_s * q_a))
+                       printf '%s %s %s\n' "$now" "$total_bytes" "$free_bytes" > "$quota_cache_file" 2>/dev/null || true
+                       ;;
+                esac
+            fi
+        fi
+
+        # Optimization: Count files by content directory mtime
+        content_dir="$cache_entry/content"
+        if [ -d "$content_dir" ]; then
+            cnt_cache_file="$runtime_dir/cnt_${encoded}.tmp"
+            dir_mtime=$(stat -c %Y "$content_dir" 2>/dev/null || echo 0)
+            recount=1
+            if [ -r "$cnt_cache_file" ]; then
+                read -r last_mtime last_cnt < "$cnt_cache_file" 2>/dev/null || true
+                if [ "$last_mtime" = "$dir_mtime" ] && [ -n "$last_cnt" ]; then
+                    cached_files_count="$last_cnt"
+                    recount=0
+                fi
+            fi
+            if [ "$recount" -eq 1 ]; then
+                cached_files_count=$(find "$content_dir" -maxdepth 1 -type f 2>/dev/null | wc -l || echo 0)
+                printf '%s %s\n' "$dir_mtime" "$cached_files_count" > "$cnt_cache_file" 2>/dev/null || true
+            fi
         fi
     fi
 
     # Optimization: Cache journalctl activity for 10s when active
     activity=""
     if [ "$active" = "active" ]; then
-        act_cache_file="/tmp/onedriver_act_${encoded}.tmp"
+        act_cache_file="$runtime_dir/act_${encoded}.tmp"
         read_act=1
         if [ -r "$act_cache_file" ]; then
             read -r last_act_ts last_act < "$act_cache_file" 2>/dev/null || true
@@ -173,26 +214,6 @@ Q_EOF
                 | sed -E 's/\x1B\[[0-9;]*[[:alpha:]]//g' \
                 | sed 's/[[:space:]][[:space:]]*/ /g')
             printf '%s %s\n' "$now" "$activity" > "$act_cache_file" 2>/dev/null || true
-        fi
-    fi
-
-    # Optimization: Count files by content directory mtime
-    cached_files_count=0
-    content_dir="$cache_entry/content"
-    if [ -d "$content_dir" ]; then
-        cnt_cache_file="/tmp/onedriver_cnt_${encoded}.tmp"
-        dir_mtime=$(stat -c %Y "$content_dir" 2>/dev/null || echo 0)
-        recount=1
-        if [ -r "$cnt_cache_file" ]; then
-            read -r last_mtime last_cnt < "$cnt_cache_file" 2>/dev/null || true
-            if [ "$last_mtime" = "$dir_mtime" ] && [ -n "$last_cnt" ]; then
-                cached_files_count="$last_cnt"
-                recount=0
-            fi
-        fi
-        if [ "$recount" -eq 1 ]; then
-            cached_files_count=$(find "$content_dir" -maxdepth 1 -type f 2>/dev/null | wc -l || echo 0)
-            printf '%s %s\n' "$dir_mtime" "$cached_files_count" > "$cnt_cache_file" 2>/dev/null || true
         fi
     fi
 
