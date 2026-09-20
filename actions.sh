@@ -168,6 +168,33 @@ ensure_systemd_override() {
     fi
 }
 
+check_nautilus_prerequisites() {
+    missing=""
+
+    for binary in onedriver systemctl findmnt python3 nautilus; do
+        if ! command -v "$binary" >/dev/null 2>&1; then
+            missing="${missing}${missing:+, }$binary"
+        fi
+    done
+
+    if ! command -v fusermount3 >/dev/null 2>&1 && ! command -v fusermount >/dev/null 2>&1; then
+        missing="${missing}${missing:+, }fusermount3"
+    fi
+
+    # The extension imports the 4.1 API explicitly; accepting only 4.0 here
+    # would create an apparently successful installation with no emblems.
+    if ! python3 -c "import gi; gi.require_version('Nautilus', '4.1'); from gi.repository import Nautilus" >/dev/null 2>&1; then
+        missing="${missing}${missing:+, }nautilus-python (API 4.1)"
+    fi
+
+    if [ -n "$missing" ]; then
+        echo "Error: faltan requisitos para la integración de Nautilus: $missing" >&2
+        echo "Instale onedriver, nautilus-python/PyGObject y FUSE3 con el gestor de paquetes antes de continuar." >&2
+        return 1
+    fi
+    return 0
+}
+
 cmd="$1"
 shift 1 2>/dev/null || true
 
@@ -565,6 +592,8 @@ case "$cmd" in
         fi
         ;;
     install-nautilus)
+        check_nautilus_prerequisites || exit 1
+
         data_home="${XDG_DATA_HOME:-$home_dir/.local/share}"
         config_home="${XDG_CONFIG_HOME:-$home_dir/.config}"
         icons_dir="$data_home/icons/hicolor"
@@ -575,6 +604,7 @@ case "$cmd" in
         mkdir -p "$icons_dir/scalable/emblems" "$icons_dir/48x48/emblems" "$ext_dir" "$scripts_dir" "$systemd_override_dir"
 
         needs_icon_cache=0
+        integration_changed=0
 
         if [ -d "$script_dir/assets/emblems" ]; then
             for icon in "$script_dir/assets/emblems"/*.svg; do
@@ -585,10 +615,12 @@ case "$cmd" in
                 if [ ! -f "$dest_sc" ] || ! cmp -s "$icon" "$dest_sc"; then
                     cp -f "$icon" "$dest_sc" 2>/dev/null || true
                     needs_icon_cache=1
+                    integration_changed=1
                 fi
                 if [ ! -f "$dest_48" ] || ! cmp -s "$icon" "$dest_48"; then
                     cp -f "$icon" "$dest_48" 2>/dev/null || true
                     needs_icon_cache=1
+                    integration_changed=1
                 fi
             done
         fi
@@ -598,6 +630,7 @@ case "$cmd" in
         if [ -f "$src_ext" ]; then
             if [ ! -f "$dest_ext" ] || ! cmp -s "$src_ext" "$dest_ext"; then
                 cp -f "$src_ext" "$dest_ext" 2>/dev/null || true
+                integration_changed=1
             fi
         fi
 
@@ -606,6 +639,7 @@ case "$cmd" in
         if [ -f "$src_core" ]; then
             if [ ! -f "$dest_core" ] || ! cmp -s "$src_core" "$dest_core"; then
                 cp -f "$src_core" "$dest_core" 2>/dev/null || true
+                integration_changed=1
             fi
         fi
 
@@ -616,6 +650,7 @@ case "$cmd" in
                 if [ ! -f "$dest_script" ] || ! cmp -s "$src_script" "$dest_script"; then
                     cp -f "$src_script" "$dest_script" 2>/dev/null || true
                     chmod +x "$dest_script" 2>/dev/null || true
+                    integration_changed=1
                 fi
             fi
         done
@@ -627,26 +662,19 @@ case "$cmd" in
         # Ensure systemd user drop-in exists so onedriver unmount quirks never show as failures
         ensure_systemd_override
 
-        if ! python3 -c "import gi; gi.require_version('Nautilus', '4.1')" >/dev/null 2>&1 && \
-           ! python3 -c "import gi; gi.require_version('Nautilus', '4.0')" >/dev/null 2>&1 && \
-           ! ls /usr/lib*/nautilus/extensions-*/libnautilus-python.so >/dev/null 2>&1 && \
-           ! ls /usr/lib/*-linux-gnu/nautilus/extensions-*/libnautilus-python.so >/dev/null 2>&1; then
-            echo "Aviso: 'nautilus-python' no parece estar instalado. Instálelo con su gestor de paquetes para ver los emblemas en Nautilus." >&2
-        fi
-
         case "$1" in
             --restart|-r)
-                was_running=0
-                if pgrep -x nautilus >/dev/null 2>&1; then
-                    was_running=1
-                    nautilus -q 2>/dev/null || true
-                    sleep 0.5
-                fi
-                if [ "$was_running" -eq 1 ]; then
-                    nautilus >/dev/null 2>&1 &
-                fi
+                integration_changed=1
                 ;;
         esac
+
+        # A running Nautilus only loads Python extensions at process startup.
+        # Restart it on a first install/update, but never on a no-op DMS reload.
+        if [ "$integration_changed" -eq 1 ] && pgrep -x nautilus >/dev/null 2>&1; then
+            nautilus -q 2>/dev/null || true
+            sleep 0.5
+            nautilus >/dev/null 2>&1 &
+        fi
 
         echo "nautilus integration installed"
         exit 0

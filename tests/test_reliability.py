@@ -238,7 +238,7 @@ def test_extension_invalidation_and_bounded_active_files():
         def invalidate_extension_info(self):
             invalidated.append(self.path)
 
-    # Register files under /home/test/mount
+    # Register files under a portable synthetic mount path.
     mp = "/home/test/mount"
     f1 = MockFileInfo(f"{mp}/file1.txt")
     f2 = MockFileInfo(f"{mp}/sub/file2.txt")
@@ -282,9 +282,9 @@ def test_async_info_provider_contract():
         def add_emblem(self, emblem):
             self.emblems.append(emblem)
 
-    mp = "/home/andres/OneDrive-Lab"
-    if mp not in ext.mounts:
-        # Fallback if unmounted during test
+    mp = next(iter(ext.mounts), None)
+    if not mp:
+        # This integration test requires a real active onedriver mount.
         print("SKIP (no active mount)")
         return
 

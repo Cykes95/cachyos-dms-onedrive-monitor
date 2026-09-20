@@ -1,4 +1,4 @@
-# OneDrive Monitor (v1.0.7)
+# OneDrive Monitor (v1.0.8)
 
 DankMaterialShell widget for [onedriver](https://github.com/jstaf/onedriver).
 
@@ -62,6 +62,17 @@ A native, lightweight monitor and manager for Microsoft OneDrive mounts on Linux
   - `diagnostics`: Copia el informe de diagnóstico al portapapeles.
 
 ## Instalación y recarga
+
+### Requisitos
+
+El equipo debe tener DankMaterialShell 1.6 o superior, onedriver, Nautilus con
+`nautilus-python`/PyGObject y FUSE3 (`fusermount3`). En CachyOS actualizado se
+instalan mediante el gestor de paquetes habitual. Al cargar el widget, la
+integración de Nautilus se instala automáticamente y Nautilus solo se reinicia si
+hay archivos nuevos o actualizados.
+
+La cuenta de Microsoft se autoriza una vez en cada equipo desde el botón de
+cuentas del widget; las credenciales no se copian entre ordenadores.
 
 El widget se encuentra en:
 ```text
