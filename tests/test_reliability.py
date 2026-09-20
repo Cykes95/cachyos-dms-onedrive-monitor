@@ -191,6 +191,40 @@ def test_clear_cache_with_dotfiles():
     print("PASS")
 
 
+def test_large_cache_performance():
+    print("Running test_large_cache_performance...", end=" ")
+    import time
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path_to_item = {}
+        id_to_item = {}
+        for i in range(1000):
+            cid = f"ID_{i:06d}"
+            rpath = f"folder_{i % 50}/sub_{i % 10}/file_{i}.txt"
+            info = {
+                "id": cid,
+                "name": f"file_{i}.txt",
+                "size": 100,
+                "hash": "8G0J5R4KWCeDGao4rLmJcaFRMhc=",
+                "rel_path": rpath
+            }
+            path_to_item[rpath] = info
+            id_to_item[cid] = info
+
+        folder_file_counts = collections.defaultdict(int)
+        for rel_path in path_to_item:
+            parts = rel_path.split("/")
+            folder_file_counts[""] += 1
+            for j in range(1, len(parts)):
+                folder_file_counts["/".join(parts[:j])] += 1
+
+        t0 = time.perf_counter()
+        status = onedrive_core.compute_cache_status(tmpdir, path_to_item, known_folders=set(folder_file_counts.keys()), id_to_item=id_to_item, folder_file_counts=dict(folder_file_counts))
+        t1 = time.perf_counter()
+        elapsed_ms = (t1 - t0) * 1000
+        assert elapsed_ms < 20.0, f"compute_cache_status took {elapsed_ms}ms, expected < 20ms"
+    print(f"PASS ({elapsed_ms:.2f}ms)")
+
+
 if __name__ == "__main__":
     print("=== Running OneDriveMonitor Reliability Test Suite ===")
     test_quickxorhash_vector()
@@ -200,4 +234,5 @@ if __name__ == "__main__":
     test_hash_cache_includes_dev_ctime()
     test_content_dirty_coalescing()
     test_clear_cache_with_dotfiles()
-    print("=== All 7 Reliability Tests PASSED successfully! ===")
+    test_large_cache_performance()
+    print("=== All 8 Reliability Tests PASSED successfully! ===")

@@ -123,7 +123,7 @@ try:
                     remote_size = item["size"] if item else 0
                     expected_hash = item.get("hash") if item else None
 
-                    preset_cached = bool(cid and onedrive_core.is_item_cached(content_dir, cid, remote_size, expected_hash))
+                    preset_cached = bool(cid and onedrive_core.is_item_cached(content_dir, cid, remote_size, expected_hash, item_info=item))
                     try:
                         with open(fp, "rb") as f:
                             while f.readinto(mv):
@@ -141,7 +141,7 @@ try:
             remote_size = item["size"] if item else 0
             expected_hash = item.get("hash") if item else None
 
-            preset_cached = bool(cid and onedrive_core.is_item_cached(content_dir, cid, remote_size, expected_hash))
+            preset_cached = bool(cid and onedrive_core.is_item_cached(content_dir, cid, remote_size, expected_hash, item_info=item))
             try:
                 with open(target, "rb") as f:
                     while f.readinto(mv):

@@ -551,7 +551,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
 
                                 with self._sync_lock:
                                     self.syncing_paths.add(fp)
-                                preset_cached = bool(cid_f and onedrive_core.is_item_cached(content_dir, cid_f, remote_size, expected_hash))
+                                preset_cached = bool(cid_f and onedrive_core.is_item_cached(content_dir, cid_f, remote_size, expected_hash, item_info=item))
                                 try:
                                     with open(fp, "rb") as f:
                                         while f.readinto(mv):
@@ -573,7 +573,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
 
                         with self._sync_lock:
                             self.syncing_paths.add(file_path)
-                        preset_cached = bool(item_id and onedrive_core.is_item_cached(content_dir, item_id, remote_size, expected_hash))
+                        preset_cached = bool(item_id and onedrive_core.is_item_cached(content_dir, item_id, remote_size, expected_hash, item_info=item))
                         try:
                             with open(file_path, "rb") as f:
                                 while f.readinto(mv):
