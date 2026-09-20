@@ -95,6 +95,21 @@ is_mounted() {
     fi
 }
 
+unmount_safely() {
+    mp="$1"
+    [ -n "$mp" ] || return 0
+    fusermount_bin=$(command -v fusermount3 || command -v fusermount || true)
+    [ -n "$fusermount_bin" ] || return 0
+    if is_mounted "$mp"; then
+        # 1. Intentar desmontaje limpio (-u)
+        if ! "$fusermount_bin" -u "$mp" 2>/dev/null; then
+            # 2. Si falla por ocupado (Nautilus/archivos abiertos), usar lazy (-uz)
+            "$fusermount_bin" -uz "$mp" 2>/dev/null || true
+        fi
+        sleep 0.2
+    fi
+}
+
 wait_unit_stopped() {
     u="$1"
     for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
@@ -140,9 +155,9 @@ ensure_systemd_override() {
         rm -f "$systemd_override_dir/override.conf" 2>/dev/null || true
     fi
     needs_reload=0
-    if [ ! -f "$override_file" ] || grep -Fqs -- "-uz" "$override_file"; then
+    if [ ! -f "$override_file" ] || ! grep -Fqs -- "-uz" "$override_file"; then
         mkdir -p "$systemd_override_dir" 2>/dev/null || true
-        printf '# Created by DMS OneDriveMonitor\n[Service]\nExecStopPost=\nExecStopPost=-%s -u /%%I\n' "$fusermount_bin" > "$override_file" 2>/dev/null || true
+        printf '# Created by DMS OneDriveMonitor\n[Service]\nExecStopPost=\nExecStopPost=-%s -uz /%%I\n' "$fusermount_bin" > "$override_file" 2>/dev/null || true
         needs_reload=1
     fi
     if [ "$needs_reload" -eq 1 ]; then
@@ -186,10 +201,7 @@ case "$cmd" in
             if ! wait_unit_stopped "$unit"; then
                 echo "Advertencia: $unit no terminó de detenerse en el tiempo esperado" >&2
             fi
-            if [ -n "$mountpoint" ] && is_mounted "$mountpoint"; then
-                fusermount_bin=$(command -v fusermount3 || command -v fusermount || true)
-                [ -n "$fusermount_bin" ] && "$fusermount_bin" -u "$mountpoint" 2>/dev/null || true
-            fi
+            unmount_safely "$mountpoint"
             echo "stopped $unit"
             exit 0
         else
@@ -341,14 +353,10 @@ case "$cmd" in
                 failed_units="$failed_units $u(timeout)"
             fi
             mp=$(systemd-escape --unescape --path "$u_enc" 2>/dev/null || true)
+            unmount_safely "$mp"
             if [ -n "$mp" ] && is_mounted "$mp"; then
-                fusermount_bin=$(command -v fusermount3 || command -v fusermount || true)
-                [ -n "$fusermount_bin" ] && "$fusermount_bin" -u "$mp" 2>/dev/null || true
-                sleep 0.2
-                if is_mounted "$mp"; then
-                    failed=1
-                    failed_units="$failed_units $u(fuse_busy)"
-                fi
+                failed=1
+                failed_units="$failed_units $u(fuse_busy)"
             fi
             release_account_lock
         done
@@ -393,12 +401,8 @@ case "$cmd" in
                 ;;
         esac
 
-        # 3. Comprobar que el punto FUSE realmente esté desmontado
-        fusermount_bin=$(command -v fusermount3 || command -v fusermount || true)
-        if [ -n "$mountpoint" ] && is_mounted "$mountpoint"; then
-            [ -n "$fusermount_bin" ] && "$fusermount_bin" -u "$mountpoint" 2>/dev/null || true
-            sleep 0.2
-        fi
+        # 3. Comprobar que el proceso onedriver esté realmente detenido y no figure en findmnt
+        unmount_safely "$mountpoint"
         for _ in 1 2 3 4 5; do
             if [ -n "$mountpoint" ] && is_mounted "$mountpoint"; then
                 sleep 0.2
@@ -407,7 +411,10 @@ case "$cmd" in
             fi
         done
         if [ -n "$mountpoint" ] && is_mounted "$mountpoint"; then
-            echo "Error: el punto de montaje $mountpoint sigue ocupado; no se puede vaciar la caché con seguridad" >&2
+            echo "Error: el punto de montaje $mountpoint sigue ocupado en findmnt; no se puede vaciar la caché con seguridad" >&2
+            if [ "$was_active" -eq 1 ]; then
+                systemctl --user start "$unit" 2>/dev/null || true
+            fi
             exit 1
         fi
 
@@ -481,11 +488,7 @@ case "$cmd" in
             echo "Error: no se pudo detener $unit antes de desvincular" >&2
             exit 1
         fi
-        fusermount_bin=$(command -v fusermount3 || command -v fusermount || true)
-        if [ -n "$mountpoint" ] && [ -n "$fusermount_bin" ] && is_mounted "$mountpoint"; then
-            "$fusermount_bin" -u "$mountpoint" 2>/dev/null || true
-            sleep 0.2
-        fi
+        unmount_safely "$mountpoint"
         if [ -n "$mountpoint" ] && is_mounted "$mountpoint"; then
             echo "Error: el punto de montaje $mountpoint sigue ocupado; no se puede desvincular" >&2
             exit 1
