@@ -627,6 +627,13 @@ case "$cmd" in
         # Ensure systemd user drop-in exists so onedriver unmount quirks never show as failures
         ensure_systemd_override
 
+        if ! python3 -c "import gi; gi.require_version('Nautilus', '4.1')" >/dev/null 2>&1 && \
+           ! python3 -c "import gi; gi.require_version('Nautilus', '4.0')" >/dev/null 2>&1 && \
+           ! ls /usr/lib*/nautilus/extensions-*/libnautilus-python.so >/dev/null 2>&1 && \
+           ! ls /usr/lib/*-linux-gnu/nautilus/extensions-*/libnautilus-python.so >/dev/null 2>&1; then
+            echo "Aviso: 'nautilus-python' no parece estar instalado. Instálelo con su gestor de paquetes para ver los emblemas en Nautilus." >&2
+        fi
+
         case "$1" in
             --restart|-r)
                 was_running=0

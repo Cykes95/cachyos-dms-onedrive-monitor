@@ -506,6 +506,9 @@ PluginComponent {
 
     Component.onCompleted: {
         _nautilusInitDone = true;
+        if (enableNautilus && actionsPath) {
+            Quickshell.execDetached(["sh", actionsPath, "install-nautilus"]);
+        }
         refresh();
     }
 
