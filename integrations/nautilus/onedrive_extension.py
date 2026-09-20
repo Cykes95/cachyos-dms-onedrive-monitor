@@ -12,6 +12,7 @@ import time
 import threading
 import subprocess
 import unicodedata
+import weakref
 import gi
 
 gi.require_version('Nautilus', '4.1')
@@ -41,7 +42,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
         super().__init__()
         self._sync_lock = threading.Lock()
         self._active_files_lock = threading.Lock()
-        self._active_files = {}  # file_path -> Nautilus.FileInfo
+        self._active_files = weakref.WeakValueDictionary()  # file_path -> weakref to Nautilus.FileInfo
         self.cache_base = onedrive_core.get_cache_base()
         self.mounts = {}
         self.last_mount_check = 0
@@ -55,9 +56,6 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
     def _register_active_file(self, file_path: str, file_info: Nautilus.FileInfo):
         with self._active_files_lock:
             self._active_files[file_path] = file_info
-            if len(self._active_files) > 6000:
-                for k in list(self._active_files.keys())[:3000]:
-                    del self._active_files[k]
 
     def _invalidate_active_files_for_mount(self, mp: str):
         with self._active_files_lock:
@@ -84,7 +82,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
     def _trigger_content_reload(self, mount_info):
         with mount_info["lock"]:
             mount_info["reload_timer_id"] = None
-        self._load_db_if_needed(mount_info, force=True, invalidate_all_active=True)
+        self._load_db_if_needed(mount_info, force_content=True, invalidate_all_active=True)
         return False
 
     def _periodic_check(self):
@@ -173,7 +171,8 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                     except Exception:
                         pass
 
-    def _load_db_if_needed(self, mount_info: dict, file_or_files=None, force=False, invalidate_all_active=False):
+    def _load_db_if_needed(self, mount_info: dict, file_or_files=None, force=False, force_content=False, force_db=False, invalidate_all_active=False):
+        mp = mount_info.get("mountpoint", mount_info.get("mp", ""))
         db_path = mount_info["db_path"]
         content_dir = mount_info["content_dir"]
 
@@ -183,7 +182,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                 return
 
             now = time.time()
-            if not force and (now - mount_info.get("last_error_time", 0) < 3.0):
+            if not (force or force_content or force_db) and (now - mount_info.get("last_error_time", 0) < 3.0):
                 # Backoff after recent error to prevent busy loops
                 return
 
@@ -197,8 +196,8 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
             except OSError:
                 content_mtime = 0
 
-            need_db_reload = force or (db_mtime > mount_info.get("mtime", 0)) or not mount_info.get("db_ready")
-            need_content_refresh = force or (content_mtime > mount_info.get("content_mtime", 0))
+            need_db_reload = force or force_db or (db_mtime > mount_info.get("mtime", 0)) or not mount_info.get("db_ready")
+            need_content_refresh = force or force_content or (content_mtime > mount_info.get("content_mtime", 0))
 
             if not need_db_reload and not need_content_refresh:
                 return
@@ -253,7 +252,14 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                         path_to_item = current_snap.get("path_to_item", {})
                         known_folders = current_snap.get("known_folders", set())
                         id_to_item = current_snap.get("id_to_item")
-                        cache_status = onedrive_core.compute_cache_status(content_dir, path_to_item, known_folders, id_to_item)
+                        folder_file_counts = current_snap.get("folder_file_counts")
+                        cache_status = onedrive_core.compute_cache_status(
+                            content_dir,
+                            path_to_item,
+                            known_folders,
+                            id_to_item,
+                            folder_file_counts=folder_file_counts
+                        )
                         snapshot = dict(current_snap)
                         snapshot.update(cache_status)
                     else:
@@ -589,7 +595,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
 
                 # Re-check and update database snapshots for all involved mounts
                 for mi in mounts_involved.values():
-                    self._load_db_if_needed(mi, force=True, invalidate_all_active=True)
+                    self._load_db_if_needed(mi, force_content=True, invalidate_all_active=True)
 
                 for file, _, _, _, _, _, _, _ in targets_to_download:
                     try:

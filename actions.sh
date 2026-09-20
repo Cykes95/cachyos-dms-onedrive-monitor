@@ -106,7 +106,10 @@ unmount_safely() {
             # 2. Si falla por ocupado (Nautilus/archivos abiertos), usar lazy (-uz)
             "$fusermount_bin" -uz "$mp" 2>/dev/null || true
         fi
-        sleep 0.2
+        for _ in 1 2 3 4 5; do
+            if ! is_mounted "$mp"; then break; fi
+            sleep 0.2
+        done
     fi
 }
 
@@ -448,9 +451,14 @@ case "$cmd" in
         content_dir="$cache_dir/$encoded/content"
         if [ -d "$content_dir" ]; then
             chmod -R u+w "$content_dir" 2>/dev/null || true
-            rm -rf "$content_dir"/* 2>/dev/null || true
+            find "$content_dir" -mindepth 1 -delete 2>/dev/null || \
+                find "$content_dir" -mindepth 1 -exec rm -rf {} + 2>/dev/null || \
+                rm -rf "$content_dir"/* "$content_dir"/.[!.]* "$content_dir"/..?* 2>/dev/null || true
             if [ "$(ls -A "$content_dir" 2>/dev/null)" ]; then
                 echo "Error: no se pudo vaciar completamente el directorio de contenido" >&2
+                if [ "$was_active" -eq 1 ]; then
+                    systemctl --user start "$unit" 2>/dev/null || true
+                fi
                 exit 1
             fi
         fi
