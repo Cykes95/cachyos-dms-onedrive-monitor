@@ -22,7 +22,9 @@ A native, lightweight monitor and manager for Microsoft OneDrive mounts on Linux
     estado queda sin clasificar para evitar falsos positivos al entrar por primera vez en una carpeta.
   - Menú contextual inteligente en Nautilus:
     - "OneDrive: Liberar espacio local" para archivos/carpetas ya sincronizados.
-    - "OneDrive: Descargar en este equipo" para archivos/carpetas en la nube (soporte para carpetas con estado mixto).
+    - "OneDrive: Descargar archivo" para archivos seleccionados en la nube. Las
+      carpetas no se descargan recursivamente desde el menú contextual para evitar
+      consumos inesperados de espacio y datos.
     - Scripts de fallback compatibles con `nautilus-scripts`.
 
 - **Rendimiento e I/O Optimizado**:

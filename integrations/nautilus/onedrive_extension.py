@@ -2,7 +2,7 @@
 """
 OneDrive Nautilus Extension
 - Displays cloud and synced emblems (onedrive-custom-cloud / onedrive-custom-synced)
-- Provides context menu to "Liberar espacio local" and "Descargar en este equipo"
+- Provides context menu to "Liberar espacio local" and safe file-only downloads
 - Powered by onedrive_core (transactional bbolt B+ tree parser, remote size checks, active FUSE detection)
 """
 
@@ -518,7 +518,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
 
         onedrive_files = []
         has_synced = False
-        has_cloud = False
+        cloud_files = []
 
         for file in files:
             loc = file.get_location()
@@ -550,17 +550,16 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                 in_cloud = rel_path in snapshot.get("cloud_folders", set())
                 if in_cached:
                     has_synced = True
-                if in_cloud:
-                    has_cloud = True
                 is_downloaded = in_cached and not in_cloud
             else:
                 is_downloaded = bool(item_id and item_id in cached_ids)
                 if is_downloaded:
                     has_synced = True
-                else:
-                    has_cloud = True
 
-            onedrive_files.append((file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded))
+            entry = (file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded)
+            onedrive_files.append(entry)
+            if not is_dir and not is_downloaded:
+                cloud_files.append(entry)
 
         if not onedrive_files:
             return []
@@ -578,23 +577,27 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
             item_free.connect("activate", self._on_free_space_activate, onedrive_files)
             menu_items.append(item_free)
 
-        # Option: Download now (fetches files through FUSE)
-        if has_cloud:
+        # Download only explicit file selections.  A folder may contain many
+        # gigabytes and must never be expanded by a context-menu action.
+        if cloud_files:
+            file_count = len(cloud_files)
             item_download = Nautilus.MenuItem(
                 name="OneDrive::DownloadNow",
-                label="OneDrive: Descargar en este equipo",
-                tip="Descarga una copia local completa para usar sin conexión",
+                label="OneDrive: Descargar archivo" if file_count == 1 else f"OneDrive: Descargar {file_count} archivos",
+                tip="Descarga sólo los archivos seleccionados para usarlos sin conexión",
                 icon="onedrive-custom-synced"
             )
-            item_download.connect("activate", self._on_download_activate, onedrive_files)
+            item_download.connect("activate", self._on_download_activate, cloud_files)
             menu_items.append(item_download)
 
         return menu_items
 
     def get_background_items(self, current_folder: Nautilus.FileInfo) -> list:
-        if not current_folder:
-            return []
-        return self.get_file_items([current_folder])
+        # Do not expose a download operation for the current folder. Nautilus
+        # can request background and selection menus in the same interaction;
+        # treating the background folder as a selected file caused accidental
+        # recursive downloads.
+        return []
 
     def _on_free_space_activate(self, menu_item, onedrive_files):
         # A2: Directing to safe, verified cache clearing avoids destroying open descriptors or unuploaded changes
@@ -606,15 +609,10 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
 
     def _on_download_activate(self, menu_item, onedrive_files):
         with self._sync_lock:
-            # 1. Prune child targets if ancestor directory is already in selection
-            selected_dirs = {f[1] for f in onedrive_files if f[5]}
-            pruned_files = [
-                f for f in onedrive_files
-                if not any(f[1] != d and f[1].startswith(d + "/") for d in selected_dirs)
-            ]
-            # 2. Filter out targets that are already actively syncing
+            # Defense in depth: this handler accepts files only, even if it is
+            # invoked by a stale Nautilus menu object from an older extension.
             targets_to_download = [
-                f for f in pruned_files
+                f for f in onedrive_files if not f[5]
                 if not any(f[1] == p or f[1].startswith(p + "/") for p in self.syncing_paths)
             ]
             if not targets_to_download:
@@ -687,76 +685,38 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
                 if encoded in per_mount:
                     per_mount[encoded][outcome] += 1
 
-            def walk_error(err):
-                nonlocal failed
-                failed += 1
-
             try:
                 for file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded in targets_to_download:
                     content_dir = mount_info.get("content_dir")
                     snapshot = mount_info.get("snapshot") or {}
                     path_to_item = snapshot.get("path_to_item", {})
+                    norm_rel = unicodedata.normalize("NFC", rel_path)
+                    item = path_to_item.get(norm_rel)
+                    remote_size = item["size"] if item else 0
+                    expected_hash = item.get("hash") if item else None
 
-                    if is_dir:
-                        for root_dir, _, filenames in os.walk(file_path, onerror=walk_error):
-                            for fn in filenames:
-                                fp = os.path.join(root_dir, fn)
-                                rel_f = unicodedata.normalize("NFC", os.path.relpath(fp, mp))
-                                item = path_to_item.get(rel_f)
-                                cid_f = item["id"] if item else None
-                                remote_size = item["size"] if item else 0
-                                expected_hash = item.get("hash") if item else None
-
-                                with self._sync_lock:
-                                    self.syncing_paths.add(fp)
-                                preset_cached = bool(cid_f and onedrive_core.is_item_cached(content_dir, cid_f, remote_size, expected_hash, item_info=item))
-                                try:
-                                    with open(fp, "rb") as f:
-                                        while f.readinto(mv):
-                                            pass
-                                    if preset_cached:
-                                        already_cached += 1
-                                        record(mount_info, "already_cached")
-                                    elif cid_f and onedrive_core.is_item_cached(content_dir, cid_f, remote_size, expected_hash, item_info=item):
-                                        downloaded += 1
-                                        record(mount_info, "downloaded")
-                                    else:
-                                        failed += 1
-                                        record(mount_info, "failed")
-                                except Exception:
-                                    failed += 1
-                                    record(mount_info, "failed")
-                                finally:
-                                    with self._sync_lock:
-                                        self.syncing_paths.discard(fp)
-                    else:
-                        norm_rel = unicodedata.normalize("NFC", rel_path)
-                        item = path_to_item.get(norm_rel)
-                        remote_size = item["size"] if item else 0
-                        expected_hash = item.get("hash") if item else None
-
-                        with self._sync_lock:
-                            self.syncing_paths.add(file_path)
-                        preset_cached = bool(item_id and onedrive_core.is_item_cached(content_dir, item_id, remote_size, expected_hash, item_info=item))
-                        try:
-                            with open(file_path, "rb") as f:
-                                while f.readinto(mv):
-                                    pass
-                            if preset_cached:
-                                already_cached += 1
-                                record(mount_info, "already_cached")
-                            elif item_id and onedrive_core.is_item_cached(content_dir, item_id, remote_size, expected_hash, item_info=item):
-                                downloaded += 1
-                                record(mount_info, "downloaded")
-                            else:
-                                failed += 1
-                                record(mount_info, "failed")
-                        except Exception:
+                    with self._sync_lock:
+                        self.syncing_paths.add(file_path)
+                    preset_cached = bool(item_id and onedrive_core.is_item_cached(content_dir, item_id, remote_size, expected_hash, item_info=item))
+                    try:
+                        with open(file_path, "rb") as f:
+                            while f.readinto(mv):
+                                pass
+                        if preset_cached:
+                            already_cached += 1
+                            record(mount_info, "already_cached")
+                        elif item_id and onedrive_core.is_item_cached(content_dir, item_id, remote_size, expected_hash, item_info=item):
+                            downloaded += 1
+                            record(mount_info, "downloaded")
+                        else:
                             failed += 1
                             record(mount_info, "failed")
-                        finally:
-                            with self._sync_lock:
-                                self.syncing_paths.discard(file_path)
+                    except Exception:
+                        failed += 1
+                        record(mount_info, "failed")
+                    finally:
+                        with self._sync_lock:
+                            self.syncing_paths.discard(file_path)
             finally:
                 with self._sync_lock:
                     for _, file_path, _, _, _, _, _, _ in targets_to_download:

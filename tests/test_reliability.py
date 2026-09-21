@@ -10,6 +10,7 @@ Verifies:
 6. Event coalescing via content_dirty in worker.
 7. Cache clearing safely purges dotfiles and hidden directories.
 8. Manual-download activity events are atomically encoded for the widget.
+9. The Nautilus download action cannot expand a folder recursively.
 """
 
 import os
@@ -296,6 +297,23 @@ def test_manual_download_activity_event():
     print("PASS")
 
 
+def test_download_action_is_file_only():
+    print("Running test_download_action_is_file_only...", end=" ")
+    import inspect
+    import onedrive_extension
+
+    ext = onedrive_extension.OneDriveExtension()
+    assert ext.get_background_items(None) == []
+
+    # Even a stale menu object carrying a directory must be ignored before a
+    # worker is started. This is the final guard against recursive cache fills.
+    directory_entry = (None, "/tmp/onedrive-folder", None, None, None, True, "folder", False)
+    ext._on_download_activate(None, [directory_entry])
+    assert not ext.syncing_paths
+    assert "os.walk" not in inspect.getsource(ext._on_download_activate)
+    print("PASS")
+
+
 def test_async_info_provider_contract():
     print("Running test_async_info_provider_contract...", end=" ")
     import gi
@@ -370,5 +388,6 @@ if __name__ == "__main__":
     test_large_cache_performance()
     test_extension_invalidation_and_bounded_active_files()
     test_manual_download_activity_event()
+    test_download_action_is_file_only()
     test_async_info_provider_contract()
-    print("=== All 11 Reliability Tests PASSED successfully! ===")
+    print("=== All 12 Reliability Tests PASSED successfully! ===")
