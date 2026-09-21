@@ -608,6 +608,7 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
         )
 
     def _on_download_activate(self, menu_item, onedrive_files):
+        files_to_invalidate = []
         with self._sync_lock:
             # Defense in depth: this handler accepts files only, even if it is
             # invoked by a stale Nautilus menu object from an older extension.
@@ -621,10 +622,16 @@ class OneDriveExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.MenuPro
             # 3. Mark as syncing and update emblems immediately
             for file, file_path, mp, mount_info, item_id, is_dir, rel_path, is_downloaded in targets_to_download:
                 self.syncing_paths.add(file_path)
-                try:
-                    file.invalidate_extension_info()
-                except Exception:
-                    pass
+                files_to_invalidate.append(file)
+
+        # Nautilus may resolve this invalidation synchronously. Never call it
+        # while holding _sync_lock, because the InfoProvider path reads the same
+        # lock and would deadlock the file-manager's main thread.
+        for file in files_to_invalidate:
+            try:
+                file.invalidate_extension_info()
+            except Exception:
+                pass
 
         operation_id = f"{int(time.time() * 1000000):x}_{threading.get_ident():x}"
         activity_targets = {}

@@ -11,6 +11,7 @@ Verifies:
 7. Cache clearing safely purges dotfiles and hidden directories.
 8. Manual-download activity events are atomically encoded for the widget.
 9. The Nautilus download action cannot expand a folder recursively.
+10. Download invalidation never re-enters the extension lock.
 """
 
 import os
@@ -314,6 +315,48 @@ def test_download_action_is_file_only():
     print("PASS")
 
 
+def test_download_invalidation_does_not_deadlock():
+    print("Running test_download_invalidation_does_not_deadlock...", end=" ")
+    import threading
+    import onedrive_extension
+
+    ext = onedrive_extension.OneDriveExtension()
+    lock_attempts = []
+    worker_started = threading.Event()
+    original_acquire = onedrive_core.acquire_lock
+    original_runtime = os.environ.get("XDG_RUNTIME_DIR")
+
+    class MockFileInfo:
+        def invalidate_extension_info(self):
+            acquired = ext._sync_lock.acquire(blocking=False)
+            lock_attempts.append(acquired)
+            if acquired:
+                ext._sync_lock.release()
+
+    # Stop the worker immediately after the UI-side invalidation. The test's
+    # purpose is to verify the lock ordering in the activation callback.
+    def reject_lock(*args, **kwargs):
+        worker_started.set()
+        return None, False
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["XDG_RUNTIME_DIR"] = tmpdir
+            onedrive_core.acquire_lock = reject_lock
+            mount_info = {"encoded": "test-account"}
+            entry = (MockFileInfo(), "/tmp/onedrive-file", "/tmp", mount_info, "file-id", False, "file.txt", False)
+            ext._on_download_activate(None, [entry])
+            assert lock_attempts == [True], "Nautilus invalidation ran while _sync_lock was held"
+            assert worker_started.wait(2.0), "Download worker was not started"
+    finally:
+        onedrive_core.acquire_lock = original_acquire
+        if original_runtime is None:
+            os.environ.pop("XDG_RUNTIME_DIR", None)
+        else:
+            os.environ["XDG_RUNTIME_DIR"] = original_runtime
+    print("PASS")
+
+
 def test_async_info_provider_contract():
     print("Running test_async_info_provider_contract...", end=" ")
     import gi
@@ -389,5 +432,6 @@ if __name__ == "__main__":
     test_extension_invalidation_and_bounded_active_files()
     test_manual_download_activity_event()
     test_download_action_is_file_only()
+    test_download_invalidation_does_not_deadlock()
     test_async_info_provider_contract()
-    print("=== All 12 Reliability Tests PASSED successfully! ===")
+    print("=== All 13 Reliability Tests PASSED successfully! ===")

@@ -34,6 +34,21 @@ mkdir -p "$locks_dir" 2>/dev/null && chmod 700 "$locks_dir" 2>/dev/null || {
     mkdir -p "$locks_dir" 2>/dev/null && chmod 700 "$locks_dir" 2>/dev/null || true
 }
 
+stop_nautilus() {
+    pgrep -x nautilus >/dev/null 2>&1 || return 0
+    pkill -TERM -x nautilus 2>/dev/null || true
+    tries=0
+    while pgrep -x nautilus >/dev/null 2>&1 && [ "$tries" -lt 10 ]; do
+        sleep 0.2
+        tries=$((tries + 1))
+    done
+    # A wedged Nautilus may not answer `nautilus -q`. This helper is used only
+    # for an explicit integration restart, so do not leave the action blocked.
+    if pgrep -x nautilus >/dev/null 2>&1; then
+        pkill -KILL -x nautilus 2>/dev/null || true
+    fi
+}
+
 acquire_account_lock() {
     enc="$1"
     lfile="$locks_dir/${enc}.lock"
@@ -671,8 +686,7 @@ case "$cmd" in
         # A running Nautilus only loads Python extensions at process startup.
         # Restart it on a first install/update, but never on a no-op DMS reload.
         if [ "$integration_changed" -eq 1 ] && pgrep -x nautilus >/dev/null 2>&1; then
-            nautilus -q 2>/dev/null || true
-            sleep 0.5
+            stop_nautilus
             nautilus >/dev/null 2>&1 &
         fi
 
@@ -694,7 +708,7 @@ case "$cmd" in
         fi
         systemctl --user daemon-reload 2>/dev/null || true
         if pgrep -x nautilus >/dev/null 2>&1; then
-            nautilus -q 2>/dev/null || true
+            stop_nautilus
         fi
         echo "nautilus integration uninstalled"
         exit 0
@@ -703,8 +717,7 @@ case "$cmd" in
         was_running=0
         if pgrep -x nautilus >/dev/null 2>&1; then
             was_running=1
-            nautilus -q 2>/dev/null || true
-            sleep 0.5
+            stop_nautilus
         fi
         if [ "$was_running" -eq 1 ]; then
             nautilus >/dev/null 2>&1 &
